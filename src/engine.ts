@@ -279,15 +279,59 @@ export class SharedContextEngine {
     tokenBudget?: number;
     runtimeContext?: Record<string, unknown>;
   }): Promise<void> {
-    // Legacy behavior: no-op (Runtime handles persistence)
+    const { shared, agentId, agentCfg } = this._isShared(params.sessionId);
 
-    // 共享 Agent：清理共享池 / Shared agent: cleanup pool
-    const { shared, agentId } = this._isShared(params.sessionId);
-    if (shared) {
-      const localSource = this.sources.get("local") as LocalSource;
+    this.apiLogger?.info?.(`[context-shared-claw] afterTurn called | sessionId=${params.sessionId} | agentId=${agentId} | shared=${shared} | msgCount=${params.messages?.length} | prePrompt=${params.prePromptMessageCount}`);
+
+    if (!shared || !agentCfg) return;
+    if (params.isHeartbeat) return;
+
+    // 写入共享池：提取本轮新增的消息（prePromptMessageCount 之后的）
+    // Write to shared pool: extract new messages from this turn
+    const newMessages = params.messages.slice(params.prePromptMessageCount);
+
+    this.apiLogger?.info?.(`[context-shared-claw] afterTurn | newMessages=${newMessages.length}`);
+
+    const localSource = this.sources.get("local") as LocalSource;
+
+    for (const msg of newMessages) {
+      const content = extractText(msg.content);
+      if (!content || content.length < 50) continue;
+
+      // 去重 / Dedup
       if (localSource) {
-        await localSource.cleanup(this.config.maxContextEntries);
+        const recent = await localSource.getRecentByAgent(agentId, 5);
+        if (recent.some((e) => isSimilar(e.content, content, 0.8))) continue;
       }
+
+      const tokens = estimateTokens(content);
+      const entry: ContextEntry = {
+        id: `${agentId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`,
+        agentId,
+        sessionId: params.sessionId,
+        content: (msg as any).role === "tool" && tokens > 2000
+          ? content.slice(0, 6000) + "\n[... truncated for shared context]"
+          : content,
+        role: (msg as any).role || "unknown",
+        timestamp: Date.now(),
+        tokens: (msg as any).role === "tool" && tokens > 2000
+          ? estimateTokens(content.slice(0, 6000))
+          : tokens,
+        tags: [],
+        source: "local",
+      };
+
+      const writeTo = agentCfg.writeTo || agentCfg.sources[0] || "local";
+      const source = this.sources.get(writeTo);
+      if (source) await source.write(entry);
+
+      this.stats.recordIngest(agentId, entry.tokens);
+      this.stats.recordPoolEntry(agentId, entry.tokens);
+    }
+
+    // 清理共享池 / Cleanup shared pool
+    if (localSource) {
+      await localSource.cleanup(this.config.maxContextEntries);
     }
   }
 

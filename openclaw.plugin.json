@@ -81,6 +81,16 @@
         "type": "number",
         "description": "Default token budget for assembly / 默认 assemble token 预算",
         "default": 4000
+      },
+      "sharedBudgetRatio": {
+        "type": "number",
+        "description": "Max ratio of budget for shared context (0-1) / 共享上下文占总预算的最大比例",
+        "default": 0.3
+      },
+      "announceProtectTTL": {
+        "type": "number",
+        "description": "Announce protection TTL in milliseconds / Announce 保护 TTL（毫秒）",
+        "default": 86400000
       }
     },
     "additionalProperties": false

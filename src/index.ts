@@ -19,7 +19,9 @@ export function activate(api: any): void {
   logger?.info?.("[context-shared-claw] Activating plugin...");
 
   // 获取插件配置 / Get plugin configuration
-  const config = api.config || {};
+  // api.pluginConfig = plugins.entries["context-shared-claw"].config
+  // api.config = 全局 OpenClaw 配置 / global OpenClaw config
+  const config = api.pluginConfig || {};
 
   // 创建共享上下文引擎实例 / Create shared context engine instance
   const engine = new SharedContextEngine(config, api);

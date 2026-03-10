@@ -111,6 +111,14 @@ export class SharedContextEngine {
     const tokens = estimateTokens(content);
     const startTime = Date.now();
 
+    // 检测是否为 Announce 消息 / Detect announce messages
+    const msg = params.message as any;
+    const isAnnounce =
+      msg.type === "agent_internal_event" ||
+      msg.metadata?.eventType === "task_completion" ||
+      msg.metadata?.source === "subagent" ||
+      (typeof content === "string" && content.includes("[Internal task completion event]"));
+
     // 创建上下文条目 / Create context entry
     const entry: ContextEntry = {
       id: `${agentId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`,
@@ -120,7 +128,7 @@ export class SharedContextEngine {
       role: params.message.role,
       timestamp: Date.now(),
       tokens,
-      tags: [],
+      tags: isAnnounce ? ["task_completion", "announce", "protected"] : [],
       source: "local",
     };
 
@@ -203,10 +211,15 @@ export class SharedContextEngine {
       },
     });
 
-    // 清理过期条目 / Cleanup expired entries
+    // 清理过期条目（保护 Announce 消息）/ Cleanup expired entries (protect Announce)
     const localSource = this.sources.get("local") as LocalSource;
     if (localSource) {
-      await localSource.cleanup(this.config.maxContextEntries);
+      await localSource.cleanup(this.config.maxContextEntries, {
+        protectFilter: (entry: ContextEntry) =>
+          entry.tags?.includes("task_completion") ||
+          entry.tags?.includes("announce") ||
+          false,
+      });
     }
   }
 
@@ -238,6 +251,22 @@ export class SharedContextEngine {
     const startTime = Date.now();
     const budget = params.tokenBudget || this.config.defaultTokenBudget;
 
+    // 保护 Announce 消息：识别 AgentInternalEvent（子代理完成通知）
+    // Protect Announce messages: identify AgentInternalEvent (subagent completion)
+    // 这些消息必须始终包含在组装结果中，不能被共享上下文挤掉
+    const announceMessages = params.messages.filter(
+      (m: any) => m.type === "agent_internal_event" ||
+        m.metadata?.eventType === "task_completion" ||
+        m.metadata?.source === "subagent" ||
+        (m.role === "user" && typeof m.content === "string" &&
+          m.content.includes("[Internal task completion event]"))
+    );
+
+    // 预留 Announce 消息的 token 预算 / Reserve token budget for announce messages
+    const announceTokens = announceMessages.reduce(
+      (sum: number, m: any) => sum + estimateTokens(m.content || ""), 0
+    );
+
     // 从最后几条消息提取查询关键词 / Extract query from recent messages
     const recentMessages = params.messages.slice(-5);
     const query = recentMessages
@@ -256,8 +285,9 @@ export class SharedContextEngine {
     }
 
     // 按相关性和时间排序，截断到 token 预算 / Sort and truncate to budget
-    // 预留 50% 预算给共享上下文 / Reserve 50% budget for shared context
-    const sharedBudget = Math.floor(budget * 0.5);
+    // 预留 50% 预算给共享上下文，扣除 Announce 消息占用
+    // Reserve 50% budget for shared context, minus announce token reservation
+    const sharedBudget = Math.floor((budget - announceTokens) * 0.5);
     let usedTokens = 0;
     const selectedEntries: ContextEntry[] = [];
 
@@ -326,6 +356,9 @@ export class SharedContextEngine {
   /**
    * compact — 上下文压缩
    * Compact shared context to save tokens
+   *
+   * 注意：task_completion 类型的消息（Announce 结果）不可被压缩
+   * Note: task_completion messages (Announce results) are never compacted
    */
   async compact(params: {
     sessionId: string;
@@ -355,8 +388,15 @@ export class SharedContextEngine {
     const preCount = await localSource.count();
     const preTokens = params.currentTokenCount || 0;
 
-    // 清理过期条目 / Cleanup old entries
-    const removed = await localSource.cleanup(this.config.maxContextEntries);
+    // 清理过期条目，但保护 Announce/task_completion 条目
+    // Cleanup old entries, but protect Announce/task_completion entries
+    const removed = await localSource.cleanup(this.config.maxContextEntries, {
+      protectFilter: (entry: ContextEntry) =>
+        entry.tags?.includes("task_completion") ||
+        entry.tags?.includes("announce") ||
+        entry.content?.includes("[Internal task completion event]") ||
+        false,
+    });
 
     const postCount = await localSource.count();
     const estimatedRemovedTokens = removed * 50; // 估算每条约50 token

@@ -1,9 +1,15 @@
 /**
- * engine.ts — ContextEngine 核心实现
- * Core ContextEngine implementation for shared context
+ * engine.ts — ContextEngine 核心实现（包装模式）
+ * Core ContextEngine implementation (wrapper pattern)
  *
- * 实现 OpenClaw ContextEngine 接口，管理跨 Agent 共享上下文
- * Implements OpenClaw ContextEngine interface, manages cross-agent shared context
+ * 包装 LegacyContextEngine，在其基础上增加跨 Agent 共享上下文能力。
+ * Wraps LegacyContextEngine, adding cross-agent shared context on top.
+ *
+ * - 非共享 Agent → 100% 委托 legacy（完全不干预）
+ * - 共享 Agent → legacy 基础工作 + 注入共享上下文
+ *
+ * - Non-shared agents → 100% delegated to legacy (zero interference)
+ * - Shared agents → legacy base work + shared context injection
  */
 
 import * as crypto from "node:crypto";
@@ -19,18 +25,25 @@ import { generateCompare } from "./debug/compare.js";
 import type { SharedSource } from "./sources/local.js";
 
 /**
- * SharedContextEngine — 共享上下文引擎
+ * SharedContextEngine — 包装模式共享上下文引擎
+ * Wrapper-pattern shared context engine
  *
- * 核心逻辑：
- * 1. ingest: 将 agent 消息写入共享上下文池
- * 2. assemble: 从共享池中检索相关上下文，注入到消息流
- * 3. compact: 压缩共享上下文，控制 token 消耗
+ * 架构 / Architecture:
+ *
+ *   用户消息 → SharedContextEngine
+ *                │
+ *                ├── 非共享 Agent → legacy.method() → 原始结果
+ *                │
+ *                └── 共享 Agent → legacy.method() → 原始结果
+ *                                    + 共享上下文逻辑 → 增强结果
  */
 export class SharedContextEngine {
   readonly info = {
+    id: "context-shared-claw",
     name: "context-shared-claw",
-    version: "0.1.0",
-    description: "Cross-agent shared context engine / 跨 Agent 共享上下文引擎",
+    version: "0.2.0",
+    description: "Cross-agent shared context engine (wrapper mode) / 跨 Agent 共享上下文引擎（包装模式）",
+    ownsCompaction: false, // legacy 负责 compaction / legacy handles compaction
   };
 
   private config: PluginConfig;
@@ -38,10 +51,35 @@ export class SharedContextEngine {
   private logger: DebugLogger;
   private stats: StatsTracker;
   private apiLogger: any;
+  private legacy: any; // LegacyContextEngine 实例 / LegacyContextEngine instance
 
   constructor(pluginConfig: Record<string, unknown>, api: any) {
     this.config = resolveConfig(pluginConfig);
     this.apiLogger = api?.logger;
+
+    // 初始化 legacy 引擎 / Initialize legacy engine
+    // 通过动态 import 获取 LegacyContextEngine
+    try {
+      const { LegacyContextEngine } = require(
+        require.resolve("@anthropic-ai/openclaw/dist/plugin-sdk/context-engine/legacy.js",
+          { paths: [process.cwd(), __dirname, "/usr/lib/node_modules/openclaw"] })
+      );
+      this.legacy = new LegacyContextEngine();
+      this.apiLogger?.info?.("[context-shared-claw] Legacy engine loaded for delegation");
+    } catch {
+      // 回退：尝试其他路径 / Fallback: try other paths
+      try {
+        const legacyPath = require.resolve("openclaw/dist/plugin-sdk/context-engine/legacy.js");
+        const { LegacyContextEngine } = require(legacyPath);
+        this.legacy = new LegacyContextEngine();
+        this.apiLogger?.info?.("[context-shared-claw] Legacy engine loaded (fallback path)");
+      } catch {
+        this.legacy = null;
+        this.apiLogger?.warn?.(
+          "[context-shared-claw] Could not load LegacyContextEngine — non-shared agents will use passthrough"
+        );
+      }
+    }
 
     // 初始化来源 / Initialize sources
     this.sources.set("local", new LocalSource(this.config));
@@ -52,80 +90,77 @@ export class SharedContextEngine {
     this.stats = new StatsTracker(this.config);
 
     this.apiLogger?.info?.(
-      `[context-shared-claw] Initialized | agents=${Object.keys(this.config.agents).length} | compareMode=${this.config.compareMode}`
+      `[context-shared-claw] Initialized (wrapper mode) | agents=${Object.keys(this.config.agents).length} | legacy=${!!this.legacy} | compareMode=${this.config.compareMode}`
     );
   }
 
   /**
+   * 判断是否为共享 Agent / Check if agent has shared enabled
+   */
+  private _isShared(sessionId: string): { shared: boolean; agentId: string; agentCfg?: AgentConfig } {
+    const agentId = extractAgentId(sessionId);
+    const agentCfg = getAgentConfig(this.config, sessionId);
+    return { shared: !!agentCfg?.shared, agentId, agentCfg };
+  }
+
+  // ════════════════════════════════════════════════════════════
+  // ContextEngine 接口方法 / ContextEngine interface methods
+  // ════════════════════════════════════════════════════════════
+
+  /**
    * bootstrap — 会话初始化
-   * Session initialization, load existing shared context
+   * 非共享：委托 legacy | 共享：委托 legacy + 记录日志
    */
   async bootstrap(params: {
     sessionId: string;
     sessionFile: string;
-  }): Promise<{ messages?: any[] }> {
-    const agentId = extractAgentId(params.sessionId);
-    const agentCfg = getAgentConfig(this.config, params.sessionId);
+  }) {
+    const { shared, agentId } = this._isShared(params.sessionId);
 
-    this.logger.log({
-      timestamp: new Date().toISOString(),
-      agentId,
-      sessionId: params.sessionId,
-      operation: "bootstrap",
-      details: {
-        shared: agentCfg?.shared ?? false,
-        sources: agentCfg?.sources ?? [],
-      },
-    });
+    // 始终委托 legacy / Always delegate to legacy
+    const legacyResult = this.legacy?.bootstrap
+      ? await this.legacy.bootstrap(params)
+      : {};
 
-    // 未配置或未启用共享：透传 / Not configured or not enabled: passthrough
-    if (!agentCfg?.shared) {
-      return {};
+    if (shared) {
+      this.logger.log({
+        timestamp: new Date().toISOString(),
+        agentId,
+        sessionId: params.sessionId,
+        operation: "bootstrap",
+        details: { shared: true, legacyDelegated: true },
+      });
     }
 
-    return {};
+    return legacyResult;
   }
 
   /**
    * ingest — 消息摄入
-   * Ingest a message into the shared context pool
-   *
-   * 平衡策略：Announce 消息不写入共享池（避免重复注入和无限累积），
-   * 只有普通对话消息才进入共享池供其他 Agent 检索。
-   *
-   * Balanced strategy: Announce messages are NOT written to the shared pool
-   * (prevents duplication and unbounded accumulation). Only regular conversation
-   * messages enter the shared pool for cross-agent retrieval.
+   * 非共享：委托 legacy | 共享：委托 legacy + 写入共享池
    */
   async ingest(params: {
     sessionId: string;
     message: { role: string; content?: string };
     isHeartbeat?: boolean;
-  }): Promise<{ tokens?: number }> {
-    const agentId = extractAgentId(params.sessionId);
-    const agentCfg = getAgentConfig(this.config, params.sessionId);
+  }) {
+    const { shared, agentId, agentCfg } = this._isShared(params.sessionId);
 
-    // 未启用共享：透传 / Not enabled: passthrough
-    if (!agentCfg?.shared) {
-      return {};
-    }
+    // 始终委托 legacy / Always delegate to legacy
+    const legacyResult = this.legacy?.ingest
+      ? await this.legacy.ingest(params)
+      : { ingested: false };
 
-    // 心跳消息不处理 / Skip heartbeat messages
-    if (params.isHeartbeat) return {};
+    // 非共享 Agent：只返回 legacy 结果 / Non-shared: return legacy result only
+    if (!shared || !agentCfg) return legacyResult;
+
+    // 以下是共享逻辑 / Below is shared-only logic
+    if (params.isHeartbeat) return legacyResult;
 
     const content = params.message.content || "";
-    if (!content.trim()) return {};
+    if (!content.trim()) return legacyResult;
 
-    // 检测 Announce 消息：不写入共享池
-    // Detect Announce messages: do NOT write to shared pool
-    // 原因：Announce 已存在于 Runtime 消息流中，写入共享池会导致：
-    //   1. 重复注入（其他 Agent 的 assemble 会再次拉到）
-    //   2. 无限累积（受保护条目越来越多）
-    //   3. compact 无法释放空间
-    // Reason: Announce already exists in Runtime message stream. Writing to pool causes:
-    //   1. Duplicate injection (other agents' assemble would pull it again)
-    //   2. Unbounded accumulation (protected entries grow forever)
-    //   3. compact cannot free enough space
+    // Announce 检测
     const msg = params.message as any;
     const isAnnounce =
       msg.type === "agent_internal_event" ||
@@ -139,126 +174,94 @@ export class SharedContextEngine {
         agentId,
         sessionId: params.sessionId,
         operation: "ingest_skip_announce",
-        details: {
-          reason: "Announce messages are managed by Runtime, not shared pool",
-          contentPreview: content.slice(0, 100),
-        },
+        details: { reason: "Managed by Runtime", contentPreview: content.slice(0, 100) },
       });
-      return {};
+      return legacyResult;
     }
 
     const tokens = estimateTokens(content);
-    const startTime = Date.now();
 
-    // ====================================================
-    // 入池过滤：提高信噪比
-    // Ingestion filter: improve signal-to-noise ratio
-    // ====================================================
-
-    // 条件1：内容长度 >= 50 字符（太短的没价值，如"好的"、"ok"）
-    // Condition 1: Content length >= 50 chars (short messages have low value)
+    // 入池过滤 / Ingestion filters
     if (content.length < 50) {
       this.logger.log({
-        timestamp: new Date().toISOString(),
-        agentId,
-        sessionId: params.sessionId,
-        operation: "ingest_skip_short",
-        details: { length: content.length, contentPreview: content.slice(0, 50) },
+        timestamp: new Date().toISOString(), agentId, sessionId: params.sessionId,
+        operation: "ingest_skip_short", details: { length: content.length },
       });
-      return {};
+      return legacyResult;
     }
 
-    // 条件3：去重（和当前 Agent 最近 5 条条目比较，相似度 > 80% 则跳过）
-    // Condition 3: Dedup (compare with agent's last 5 entries, skip if >80% similar)
+    // 去重 / Dedup
     const localSource = this.sources.get("local") as LocalSource;
     if (localSource) {
       const recentEntries = await localSource.getRecentByAgent(agentId, 5);
-      const isDuplicate = recentEntries.some((e) => isSimilar(e.content, content, 0.8));
-      if (isDuplicate) {
+      if (recentEntries.some((e) => isSimilar(e.content, content, 0.8))) {
         this.logger.log({
-          timestamp: new Date().toISOString(),
-          agentId,
-          sessionId: params.sessionId,
-          operation: "ingest_skip_duplicate",
-          details: { contentPreview: content.slice(0, 100) },
+          timestamp: new Date().toISOString(), agentId, sessionId: params.sessionId,
+          operation: "ingest_skip_duplicate", details: { contentPreview: content.slice(0, 100) },
         });
-        return {};
+        return legacyResult;
       }
     }
 
-    // 创建上下文条目 / Create context entry
+    // 创建并写入共享条目 / Create and write shared entry
     const entry: ContextEntry = {
       id: `${agentId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`,
       agentId,
       sessionId: params.sessionId,
-      content,
+      content: params.message.role === "tool" && tokens > 2000
+        ? content.slice(0, 6000) + "\n[... truncated for shared context]"
+        : content,
       role: params.message.role,
       timestamp: Date.now(),
-      tokens,
+      tokens: params.message.role === "tool" && tokens > 2000
+        ? estimateTokens(content.slice(0, 6000))
+        : tokens,
       tags: [],
       source: "local",
     };
 
-    // 条件2：工具输出截断（role=tool 且超过 2000 token，只保留前 ~2000 token）
-    // Condition 2: Truncate tool output (role=tool and >2000 tokens, keep first ~2000 tokens)
-    if (params.message.role === "tool" && tokens > 2000) {
-      const truncatedContent = content.slice(0, 6000); // ~2000 tokens
-      entry.content = truncatedContent + "\n[... truncated for shared context]";
-      entry.tokens = estimateTokens(entry.content);
-    }
-
-    // 写入指定源 / Write to configured destination
     const writeTo = agentCfg.writeTo || agentCfg.sources[0] || "local";
     const source = this.sources.get(writeTo);
-    if (source) {
-      await source.write(entry);
-    }
+    if (source) await source.write(entry);
 
-    // 统计和日志 / Stats and logging
     this.stats.recordIngest(agentId, entry.tokens);
     this.stats.recordPoolEntry(agentId, entry.tokens);
-    this.logger.log({
-      timestamp: new Date().toISOString(),
-      agentId,
-      sessionId: params.sessionId,
-      operation: "ingest",
-      tokensUsed: tokens,
-      duration: Date.now() - startTime,
-      details: {
-        role: params.message.role,
-        writeTo,
-        entryId: entry.id,
-        contentLength: content.length,
-      },
-    });
 
-    return { tokens };
+    return legacyResult;
   }
 
   /**
-   * ingestBatch — 批量消息摄入
-   * Batch ingest messages into shared context pool
+   * ingestBatch — 批量摄入
+   * 始终委托 legacy + 共享 Agent 额外写入共享池
    */
   async ingestBatch(params: {
     sessionId: string;
     messages: Array<{ role: string; content?: string }>;
     isHeartbeat?: boolean;
-  }): Promise<{ results: Array<{ tokens?: number }> }> {
-    const results = [];
-    for (const message of params.messages) {
-      const result = await this.ingest({
-        sessionId: params.sessionId,
-        message,
-        isHeartbeat: params.isHeartbeat,
-      });
-      results.push(result);
+  }) {
+    // 委托 legacy / Delegate to legacy
+    const legacyResult = this.legacy?.ingestBatch
+      ? await this.legacy.ingestBatch(params)
+      : { ingestedCount: 0 };
+
+    // 共享逻辑：逐条写入 / Shared logic: write each
+    const { shared } = this._isShared(params.sessionId);
+    if (shared) {
+      for (const message of params.messages) {
+        await this.ingest({
+          sessionId: params.sessionId,
+          message,
+          isHeartbeat: params.isHeartbeat,
+        });
+      }
     }
-    return { results };
+
+    return legacyResult;
   }
 
   /**
-   * afterTurn — 轮次结束回调
-   * Called after each conversation turn
+   * afterTurn — 轮次结束
+   * 始终委托 legacy + 共享 Agent 清理共享池
    */
   async afterTurn(params: {
     sessionId: string;
@@ -270,106 +273,65 @@ export class SharedContextEngine {
     tokenBudget?: number;
     runtimeContext?: Record<string, unknown>;
   }): Promise<void> {
-    const agentId = extractAgentId(params.sessionId);
-    const agentCfg = getAgentConfig(this.config, params.sessionId);
+    // 始终委托 legacy / Always delegate to legacy
+    if (this.legacy?.afterTurn) {
+      await this.legacy.afterTurn(params);
+    }
 
-    if (!agentCfg?.shared) return;
-
-    this.logger.log({
-      timestamp: new Date().toISOString(),
-      agentId,
-      sessionId: params.sessionId,
-      operation: "afterTurn",
-      details: {
-        messageCount: params.messages.length,
-        prePromptMessageCount: params.prePromptMessageCount,
-        hasAutoCompaction: !!params.autoCompactionSummary,
-      },
-    });
-
-    // 清理过期条目 / Cleanup expired entries
-    // Announce 消息不在共享池中，无需特殊保护
-    // Announce messages are not in the shared pool, no special protection needed
-    const localSource = this.sources.get("local") as LocalSource;
-    if (localSource) {
-      await localSource.cleanup(this.config.maxContextEntries);
+    // 共享 Agent：清理共享池 / Shared agent: cleanup pool
+    const { shared, agentId } = this._isShared(params.sessionId);
+    if (shared) {
+      const localSource = this.sources.get("local") as LocalSource;
+      if (localSource) {
+        await localSource.cleanup(this.config.maxContextEntries);
+      }
     }
   }
 
   /**
-   * assemble — 上下文组装
-   * Assemble shared context into the message stream
+   * assemble — 上下文组装（核心）
+   * 始终委托 legacy + 共享 Agent 在 legacy 结果上注入共享上下文
    *
-   * 平衡策略：弹性预算分配
-   * - 共享上下文预算 = min(budget × sharedBudgetRatio, budget - 已用消息 Token)
-   * - Announce 消息由 Runtime 管理，不在此处处理
-   * - 当消息流较短时，共享上下文可多占；消息流满时，共享自动让步
-   *
-   * Balanced strategy: Elastic budget allocation
-   * - Shared budget = min(budget × sharedBudgetRatio, budget - existing message tokens)
-   * - Announce messages are managed by Runtime, not handled here
-   * - When message stream is short, shared context gets more; when full, it yields
+   * Non-shared: legacy result only
+   * Shared: legacy result + systemPromptAddition with shared context
    */
   async assemble(params: {
     sessionId: string;
     messages: Array<{ role: string; content?: string }>;
     tokenBudget?: number;
-  }): Promise<{
-    messages?: Array<{ role: string; content: string }>;
-    systemMessage?: string;
-    tokens?: number;
-  }> {
-    const agentId = extractAgentId(params.sessionId);
-    const agentCfg = getAgentConfig(this.config, params.sessionId);
+  }) {
+    // 始终委托 legacy / Always delegate to legacy
+    const legacyResult = this.legacy?.assemble
+      ? await this.legacy.assemble(params)
+      : { messages: params.messages, estimatedTokens: 0 };
 
-    // 未启用共享：透传原始消息 / Not enabled: passthrough
-    if (!agentCfg?.shared) {
-      this.stats.recordAssemble(agentId, 0, false);
-      return {};
+    const { shared, agentId, agentCfg } = this._isShared(params.sessionId);
+
+    // 非共享 Agent：直接返回 legacy 结果 / Non-shared: return legacy as-is
+    if (!shared || !agentCfg) {
+      return legacyResult;
     }
+
+    // ═══ 以下是共享 Agent 的增强逻辑 ═══
 
     const startTime = Date.now();
     const budget = params.tokenBudget || this.config.defaultTokenBudget;
 
-    // 弹性预算计算 / Elastic budget calculation
-    // 1. 计算现有消息流已占用的 Token
-    const existingTokens = params.messages.reduce(
-      (sum, m) => sum + estimateTokens(m.content || ""), 0
-    );
-
-    // 2. 计算共享上下文可用预算（取配置比例和剩余空间的较小值）
-    //    确保共享上下文不会导致总体超出预算
+    // 弹性预算 / Elastic budget
+    const existingTokens = legacyResult.estimatedTokens || 0;
     const ratioBasedBudget = Math.floor(budget * this.config.sharedBudgetRatio);
-    const remainingBudget = Math.floor((budget - existingTokens) * 0.8); // 留 20% 安全余量
+    const remainingBudget = Math.floor((budget - existingTokens) * 0.8);
     const sharedBudget = Math.max(0, Math.min(ratioBasedBudget, remainingBudget));
 
-    // 预算为 0 时跳过共享上下文 / Skip shared context when budget is 0
     if (sharedBudget === 0) {
-      this.logger.log({
-        timestamp: new Date().toISOString(),
-        agentId,
-        sessionId: params.sessionId,
-        operation: "assemble_skip",
-        details: {
-          reason: "No budget for shared context",
-          budget,
-          existingTokens,
-          ratioBasedBudget,
-          remainingBudget,
-        },
-      });
       this.stats.recordAssemble(agentId, 0, false);
-      return {};
+      return legacyResult;
     }
 
-    // 从最后几条消息提取查询关键词 / Extract query from recent messages
+    // 检索共享上下文 / Retrieve shared context
     const recentMessages = params.messages.slice(-5);
-    const query = recentMessages
-      .map((m) => m.content || "")
-      .filter(Boolean)
-      .join(" ");
+    const query = recentMessages.map((m) => m.content || "").filter(Boolean).join(" ");
 
-    // 从所有配置的来源读取共享上下文 / Read from all configured sources
     const allEntries: ContextEntry[] = [];
     for (const sourceName of agentCfg.sources) {
       const source = this.sources.get(sourceName);
@@ -379,10 +341,8 @@ export class SharedContextEngine {
       }
     }
 
-    // 按相关性和时间排序，截断到弹性预算 / Sort and truncate to elastic budget
     let usedTokens = 0;
     const selectedEntries: ContextEntry[] = [];
-
     for (const entry of allEntries) {
       if (usedTokens + entry.tokens > sharedBudget) break;
       selectedEntries.push(entry);
@@ -391,37 +351,16 @@ export class SharedContextEngine {
 
     // 对比模式 / Compare mode
     if (this.config.compareMode && selectedEntries.length > 0) {
-      generateCompare(
-        params.messages,
-        selectedEntries,
-        agentId,
-        params.sessionId,
-        this.logger
-      );
+      generateCompare(params.messages, selectedEntries, agentId, params.sessionId, this.logger);
     }
 
-    // 构建共享上下文系统消息 / Build shared context system message
-    let systemMessage: string | undefined;
-    if (selectedEntries.length > 0) {
-      const contextParts = selectedEntries.map((e) => {
-        const source = e.source === "openviking" ? "[OpenViking]" : "[Local]";
-        return `${source} [${e.agentId}] (${new Date(e.timestamp).toISOString()}): ${e.content}`;
-      });
-
-      systemMessage = [
-        "=== Shared Context from Other Agents / 其他 Agent 的共享上下文 ===",
-        ...contextParts,
-        "=== End Shared Context / 共享上下文结束 ===",
-      ].join("\n");
-    }
-
-    // 统计和日志 / Stats and logging
+    // 构建 systemPromptAddition / Build systemPromptAddition
     const sharedHit = selectedEntries.length > 0;
     this.stats.recordAssemble(agentId, usedTokens, sharedHit);
     this.stats.recordBudgetUsed(budget);
 
-    // 记录跨 Agent 流向 / Record cross-agent flow
     if (sharedHit) {
+      // 记录流向 / Record flow
       const flowBySource: Record<string, number> = {};
       for (const entry of selectedEntries) {
         flowBySource[entry.agentId] = (flowBySource[entry.agentId] || 0) + 1;
@@ -438,39 +377,37 @@ export class SharedContextEngine {
       operation: "assemble",
       tokensUsed: usedTokens,
       selectedContextCount: selectedEntries.length,
-      selectedContextIds: selectedEntries.map((e) => e.id),
-      selectionReason: query
-        ? `keyword search: "${query.slice(0, 100)}"`
-        : "recent entries (no query)",
       duration: Date.now() - startTime,
-      details: {
-        budget,
-        sharedBudget,
-        existingTokens,
-        ratioBasedBudget,
-        remainingBudget,
-        totalCandidates: allEntries.length,
-        sources: agentCfg.sources,
-      },
+      details: { budget, sharedBudget, existingTokens, totalCandidates: allEntries.length },
     });
 
-    return {
-      systemMessage,
-      tokens: usedTokens,
-    };
+    // 在 legacy 结果上追加共享上下文 / Append shared context to legacy result
+    if (selectedEntries.length > 0) {
+      const contextParts = selectedEntries.map((e) => {
+        const src = e.source === "openviking" ? "[OpenViking]" : "[Local]";
+        return `${src} [${e.agentId}] (${new Date(e.timestamp).toISOString()}): ${e.content}`;
+      });
+      const sharedMessage = [
+        "=== Shared Context from Other Agents ===",
+        ...contextParts,
+        "=== End Shared Context ===",
+      ].join("\n");
+
+      return {
+        ...legacyResult,
+        estimatedTokens: (legacyResult.estimatedTokens || 0) + usedTokens,
+        systemPromptAddition: legacyResult.systemPromptAddition
+          ? legacyResult.systemPromptAddition + "\n\n" + sharedMessage
+          : sharedMessage,
+      };
+    }
+
+    return legacyResult;
   }
 
   /**
    * compact — 上下文压缩
-   * Compact shared context to save tokens
-   *
-   * 平衡策略：所有条目都可被清理，无永久保护。
-   * Announce 消息不在共享池中，所以 compact 只处理普通条目，
-   * 不存在"保护导致无法释放空间"的风险。
-   *
-   * Balanced strategy: All entries are cleanable, no permanent protection.
-   * Announce messages are not in the shared pool, so compact only handles
-   * regular entries — no risk of "protection preventing space reclamation".
+   * 始终委托 legacy + 共享 Agent 清理共享池
    */
   async compact(params: {
     sessionId: string;
@@ -481,107 +418,58 @@ export class SharedContextEngine {
     compactionTarget?: "budget" | "threshold";
     customInstructions?: string;
     runtimeContext?: Record<string, unknown>;
-  }): Promise<{
-    compacted?: boolean;
-    removedTokens?: number;
-    summary?: string;
-  }> {
-    const agentId = extractAgentId(params.sessionId);
-    const agentCfg = getAgentConfig(this.config, params.sessionId);
+  }) {
+    // 始终委托 legacy（核心压缩逻辑）/ Always delegate to legacy (core compaction)
+    const legacyResult = this.legacy?.compact
+      ? await this.legacy.compact(params)
+      : { ok: true, compacted: false, reason: "no legacy engine" };
 
-    if (!agentCfg?.shared) {
-      return { compacted: false };
+    // 共享 Agent：额外清理共享池 / Shared agent: also cleanup shared pool
+    const { shared, agentId } = this._isShared(params.sessionId);
+    if (shared) {
+      const localSource = this.sources.get("local") as LocalSource;
+      if (localSource) {
+        const targetEntries = params.force
+          ? Math.floor(this.config.maxContextEntries * 0.5)
+          : this.config.maxContextEntries;
+        await localSource.cleanup(targetEntries);
+      }
     }
 
-    const startTime = Date.now();
-    const localSource = this.sources.get("local") as LocalSource;
-    if (!localSource) return { compacted: false };
-
-    const preCount = await localSource.count();
-    const preTokens = params.currentTokenCount || 0;
-
-    // force 模式：更激进的清理（保留更少条目）
-    // Force mode: more aggressive cleanup (keep fewer entries)
-    const targetEntries = params.force
-      ? Math.floor(this.config.maxContextEntries * 0.5) // force: 保留一半
-      : this.config.maxContextEntries;
-
-    // 所有条目均可清理，无永久保护
-    // All entries are cleanable, no permanent protection
-    const removed = await localSource.cleanup(targetEntries);
-
-    const postCount = await localSource.count();
-    const estimatedRemovedTokens = removed * 50; // 估算每条约50 token
-
-    this.stats.recordCompact(agentId, preTokens, preTokens - estimatedRemovedTokens);
-
-    this.logger.log({
-      timestamp: new Date().toISOString(),
-      agentId,
-      sessionId: params.sessionId,
-      operation: "compact",
-      tokensUsed: estimatedRemovedTokens,
-      duration: Date.now() - startTime,
-      details: {
-        preCount,
-        postCount,
-        removedEntries: removed,
-        force: params.force,
-      },
-    });
-
-    return {
-      compacted: removed > 0,
-      removedTokens: estimatedRemovedTokens,
-      summary: removed > 0
-        ? `Compacted shared context: removed ${removed} entries (est. ${estimatedRemovedTokens} tokens)`
-        : "No compaction needed",
-    };
+    return legacyResult;
   }
 
   /**
-   * prepareSubagentSpawn — 子代理生成准备
-   * Prepare context sharing for a subagent spawn
+   * prepareSubagentSpawn — 委托 legacy
    */
   async prepareSubagentSpawn(params: {
     parentSessionKey: string;
     childSessionKey: string;
     ttlMs?: number;
-  }): Promise<{ inheritedContext?: string } | undefined> {
-    const parentAgent = extractAgentId(params.parentSessionKey);
-    const parentCfg = getAgentConfig(this.config, params.parentSessionKey);
-
-    if (!parentCfg?.shared) return undefined;
-
-    // 将父 agent 的最新上下文标记为可继承 / Mark parent's recent context as inheritable
-    this.apiLogger?.debug?.(
-      `[context-shared-claw] Preparing subagent spawn: ${parentAgent} -> ${extractAgentId(params.childSessionKey)}`
-    );
-
-    return {
-      inheritedContext: `Shared context from parent agent: ${parentAgent}`,
-    };
+  }) {
+    return this.legacy?.prepareSubagentSpawn
+      ? await this.legacy.prepareSubagentSpawn(params)
+      : undefined;
   }
 
   /**
-   * onSubagentEnded — 子代理结束回调
-   * Callback when a subagent session ends
+   * onSubagentEnded — 委托 legacy
    */
   async onSubagentEnded(params: {
     childSessionKey: string;
     reason: string;
   }): Promise<void> {
-    this.apiLogger?.debug?.(
-      `[context-shared-claw] Subagent ended: ${params.childSessionKey} (${params.reason})`
-    );
+    if (this.legacy?.onSubagentEnded) {
+      await this.legacy.onSubagentEnded(params);
+    }
   }
 
   /**
-   * dispose — 清理资源
-   * Cleanup resources on shutdown
+   * dispose — 清理
    */
   async dispose(): Promise<void> {
     this.stats.flush();
+    if (this.legacy?.dispose) await this.legacy.dispose();
     this.apiLogger?.info?.("[context-shared-claw] Disposed");
   }
 

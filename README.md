@@ -264,6 +264,41 @@ Cross-Agent Flow:
 
 ---
 
+## CLI
+
+The plugin includes a CLI for direct terminal access to debug tools:
+
+```bash
+# Run directly with tsx
+npx tsx src/cli.ts <command>
+
+# Or install globally
+npm link
+context-shared-claw <command>
+```
+
+### Commands
+
+```bash
+context-shared-claw evaluate              # Evaluation report
+context-shared-claw stats                 # Statistics
+context-shared-claw stats --agent waicode # Stats for specific agent
+context-shared-claw pool-size             # Pool size
+context-shared-claw recent-logs           # Recent operation logs
+context-shared-claw recent-logs --limit 5 # Last 5 logs
+context-shared-claw config                # Current configuration
+```
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `CONTEXT_SHARED_CONFIG` | Custom config file path (overrides auto-detection) |
+
+Config is auto-detected from: OpenClaw plugin dir → shared-context dir → OpenClaw main config.
+
+---
+
 ## Testing
 
 Tests use Node.js built-in `node:test` and `node:assert`, run via tsx:

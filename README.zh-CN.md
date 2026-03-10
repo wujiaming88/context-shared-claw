@@ -263,6 +263,41 @@ Token 经济性:
 
 ---
 
+## CLI 命令行工具
+
+插件自带 CLI，可直接在终端使用调试工具：
+
+```bash
+# 用 tsx 直接运行
+npx tsx src/cli.ts <命令>
+
+# 或全局安装
+npm link
+context-shared-claw <命令>
+```
+
+### 命令列表
+
+```bash
+context-shared-claw evaluate              # 效果评估报告
+context-shared-claw stats                 # 统计数据
+context-shared-claw stats --agent waicode # 指定 Agent 的统计
+context-shared-claw pool-size             # 共享池大小
+context-shared-claw recent-logs           # 最近操作日志
+context-shared-claw recent-logs --limit 5 # 最近 5 条日志
+context-shared-claw config                # 当前配置
+```
+
+### 环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `CONTEXT_SHARED_CONFIG` | 自定义配置文件路径（覆盖自动检测） |
+
+配置自动检测顺序：OpenClaw 插件目录 → shared-context 目录 → OpenClaw 主配置。
+
+---
+
 ## 测试
 
 测试使用 Node.js 内置 `node:test` 和 `node:assert` 模块，通过 tsx 运行：

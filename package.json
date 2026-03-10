@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "OpenClaw Context Engine plugin for shared context across agents",
   "main": "src/index.ts",
+  "bin": {
+    "context-shared-claw": "./bin/context-shared-claw"
+  },
   "keywords": [
     "openclaw",
     "context-engine",

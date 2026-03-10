@@ -1,0 +1,4 @@
+#!/usr/bin/env npx tsx
+// Launcher for context-shared-claw CLI
+// Requires tsx: npm install -D tsx
+import "../src/cli.js";

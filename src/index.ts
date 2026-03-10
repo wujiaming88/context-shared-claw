@@ -27,9 +27,11 @@ export function activate(api: any): void {
   // ================================================
   // 1. 注册 Context Engine / Register Context Engine
   // ================================================
+  // registerContextEngine(id, factory) — id 必须与 plugins.slots.contextEngine 匹配
+  // registerContextEngine(id, factory) — id must match plugins.slots.contextEngine
   if (api.registerContextEngine) {
-    api.registerContextEngine(engine);
-    logger?.info?.("[context-shared-claw] Context engine registered");
+    api.registerContextEngine("context-shared-claw", () => engine);
+    logger?.info?.("[context-shared-claw] Context engine registered with id 'context-shared-claw'");
   } else {
     logger?.warn?.(
       "[context-shared-claw] api.registerContextEngine not available — running in degraded mode"

@@ -1,6 +1,6 @@
 {
-  "name": "context-shared-claw",
-  "displayName": "Shared Context Engine",
+  "id": "context-shared-claw",
+  "name": "Shared Context Engine",
   "version": "0.1.0",
   "description": "跨 Agent 共享上下文引擎 | Cross-agent shared context engine with local file and OpenViking support",
   "entryPoint": "src/index.ts",

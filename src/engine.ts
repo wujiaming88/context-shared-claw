@@ -10,6 +10,7 @@ import * as crypto from "node:crypto";
 import type { PluginConfig, ContextEntry, AgentConfig } from "./config.js";
 import { resolveConfig, getAgentConfig, extractAgentId } from "./config.js";
 import { estimateTokens } from "./utils/tokens.js";
+import { isSimilar } from "./utils/search.js";
 import { LocalSource } from "./sources/local.js";
 import { OpenVikingSource } from "./sources/openviking.js";
 import { DebugLogger } from "./debug/logger.js";
@@ -149,6 +150,42 @@ export class SharedContextEngine {
     const tokens = estimateTokens(content);
     const startTime = Date.now();
 
+    // ====================================================
+    // 入池过滤：提高信噪比
+    // Ingestion filter: improve signal-to-noise ratio
+    // ====================================================
+
+    // 条件1：内容长度 >= 50 字符（太短的没价值，如"好的"、"ok"）
+    // Condition 1: Content length >= 50 chars (short messages have low value)
+    if (content.length < 50) {
+      this.logger.log({
+        timestamp: new Date().toISOString(),
+        agentId,
+        sessionId: params.sessionId,
+        operation: "ingest_skip_short",
+        details: { length: content.length, contentPreview: content.slice(0, 50) },
+      });
+      return {};
+    }
+
+    // 条件3：去重（和当前 Agent 最近 5 条条目比较，相似度 > 80% 则跳过）
+    // Condition 3: Dedup (compare with agent's last 5 entries, skip if >80% similar)
+    const localSource = this.sources.get("local") as LocalSource;
+    if (localSource) {
+      const recentEntries = await localSource.getRecentByAgent(agentId, 5);
+      const isDuplicate = recentEntries.some((e) => isSimilar(e.content, content, 0.8));
+      if (isDuplicate) {
+        this.logger.log({
+          timestamp: new Date().toISOString(),
+          agentId,
+          sessionId: params.sessionId,
+          operation: "ingest_skip_duplicate",
+          details: { contentPreview: content.slice(0, 100) },
+        });
+        return {};
+      }
+    }
+
     // 创建上下文条目 / Create context entry
     const entry: ContextEntry = {
       id: `${agentId}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`,
@@ -162,6 +199,14 @@ export class SharedContextEngine {
       source: "local",
     };
 
+    // 条件2：工具输出截断（role=tool 且超过 2000 token，只保留前 ~2000 token）
+    // Condition 2: Truncate tool output (role=tool and >2000 tokens, keep first ~2000 tokens)
+    if (params.message.role === "tool" && tokens > 2000) {
+      const truncatedContent = content.slice(0, 6000); // ~2000 tokens
+      entry.content = truncatedContent + "\n[... truncated for shared context]";
+      entry.tokens = estimateTokens(entry.content);
+    }
+
     // 写入指定源 / Write to configured destination
     const writeTo = agentCfg.writeTo || agentCfg.sources[0] || "local";
     const source = this.sources.get(writeTo);
@@ -170,7 +215,8 @@ export class SharedContextEngine {
     }
 
     // 统计和日志 / Stats and logging
-    this.stats.recordIngest(agentId, tokens);
+    this.stats.recordIngest(agentId, entry.tokens);
+    this.stats.recordPoolEntry(agentId, entry.tokens);
     this.logger.log({
       timestamp: new Date().toISOString(),
       agentId,
@@ -372,6 +418,18 @@ export class SharedContextEngine {
     // 统计和日志 / Stats and logging
     const sharedHit = selectedEntries.length > 0;
     this.stats.recordAssemble(agentId, usedTokens, sharedHit);
+    this.stats.recordBudgetUsed(budget);
+
+    // 记录跨 Agent 流向 / Record cross-agent flow
+    if (sharedHit) {
+      const flowBySource: Record<string, number> = {};
+      for (const entry of selectedEntries) {
+        flowBySource[entry.agentId] = (flowBySource[entry.agentId] || 0) + 1;
+      }
+      for (const [sourceAgent, count] of Object.entries(flowBySource)) {
+        this.stats.recordCrossAgentFlow(sourceAgent, agentId, count);
+      }
+    }
 
     this.logger.log({
       timestamp: new Date().toISOString(),
@@ -531,6 +589,75 @@ export class SharedContextEngine {
   // 调试工具方法（供 context_debug 工具调用）
   // Debug tool methods (called by context_debug tool)
   // ============================================================
+
+  /**
+   * evaluate — 生成共享上下文效果评估报告
+   * Generate shared context effectiveness evaluation report
+   */
+  async evaluate(): Promise<string> {
+    const localSource = this.sources.get("local") as LocalSource;
+    const allEntries = localSource ? localSource.getAllEntries() : [];
+    const stats = this.stats.getStats();
+
+    // 池子健康度 / Pool health
+    const total = allEntries.length;
+    const effective = allEntries.filter((e) => e.tokens > 50).length;
+    const effectiveRatio = total > 0 ? ((effective / total) * 100).toFixed(1) : "0.0";
+    const totalTokens = allEntries.reduce((sum, e) => sum + e.tokens, 0);
+    const avgTokens = total > 0 ? Math.round(totalTokens / total) : 0;
+
+    // 信噪比评分：有效条目占比 / SNR score: effective entry ratio
+    const snr = total > 0 ? ((effective / total) * 100).toFixed(1) : "0.0";
+
+    // 使用情况 / Usage stats
+    const totalAssembles = stats.assembleHits + stats.assembleMisses;
+    const hitRate = totalAssembles > 0
+      ? ((stats.assembleHits / totalAssembles) * 100).toFixed(1)
+      : "0.0";
+    const missRate = totalAssembles > 0
+      ? ((stats.assembleMisses / totalAssembles) * 100).toFixed(1)
+      : "0.0";
+
+    // Token 经济性 / Token economics
+    const injectedTokens = stats.totalSharedTokensInjected;
+    const budgetUsed = stats.totalBudgetUsed;
+    const budgetRatio = budgetUsed > 0
+      ? ((injectedTokens / budgetUsed) * 100).toFixed(2)
+      : "0.00";
+    const maxRatio = (this.config.sharedBudgetRatio * 100).toFixed(0);
+
+    // 跨 Agent 流向 / Cross-agent flow
+    const flowLines: string[] = [];
+    for (const [source, targets] of Object.entries(stats.crossAgentFlow)) {
+      for (const [target, count] of Object.entries(targets)) {
+        flowLines.push(`  ${source} → ${target}: ${count} 条被使用`);
+      }
+    }
+
+    const report = [
+      "📊 共享上下文效果报告",
+      "─────────────────────",
+      "",
+      "池子健康度:",
+      `  总条目: ${total} | 有效条目(>50tok): ${effective} (${effectiveRatio}%)`,
+      `  平均条目大小: ${avgTokens} tok`,
+      `  信噪比评分: ${snr}% (建议 >70%)`,
+      "",
+      "使用情况:",
+      `  assemble 总次数: ${totalAssembles}`,
+      `  命中次数: ${stats.assembleHits} (${hitRate}%)`,
+      `  空命中: ${stats.assembleMisses} (${missRate}%)`,
+      "",
+      "Token 经济性:",
+      `  共享上下文总注入 Token: ${injectedTokens}`,
+      `  占总预算比例: ${budgetRatio}% (配置上限 ${maxRatio}%)`,
+      "",
+      "跨 Agent 流向:",
+      flowLines.length > 0 ? flowLines.join("\n") : "  (暂无数据)",
+    ].join("\n");
+
+    return report;
+  }
 
   /** 获取共享上下文池大小 / Get shared context pool size */
   async getPoolSize(): Promise<Record<string, number>> {

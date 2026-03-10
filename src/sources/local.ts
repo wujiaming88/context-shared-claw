@@ -298,4 +298,22 @@ export class LocalSource implements SharedSource {
 
     return totalRemoved;
   }
+
+  /**
+   * 获取某个 Agent 最近的 N 条条目 / Get an agent's most recent N entries
+   * 用于入池去重检查 / Used for ingestion dedup check
+   */
+  getRecentByAgent(agentId: string, limit: number = 5): ContextEntry[] {
+    const entries = this._readAgentIndex(agentId);
+    return entries
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, limit);
+  }
+
+  /**
+   * 获取所有条目（用于评估报告）/ Get all entries (for evaluation report)
+   */
+  getAllEntries(): ContextEntry[] {
+    return this._readAllEntries();
+  }
 }

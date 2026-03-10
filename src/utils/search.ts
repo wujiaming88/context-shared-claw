@@ -75,6 +75,53 @@ function countOccurrences(text: string, sub: string): number {
 }
 
 /**
+ * 判断两段文本是否相似（基于 bigram 相似度）
+ * Check if two texts are similar using bigram similarity (Dice coefficient)
+ *
+ * 不依赖外部库，使用简单的字符 bigram 重叠比率
+ * No external dependencies, uses simple character bigram overlap ratio
+ *
+ * @param a - 第一段文本 / First text
+ * @param b - 第二段文本 / Second text
+ * @param threshold - 相似度阈值 (0-1)，超过则视为相似 / Similarity threshold (0-1)
+ * @returns 是否相似 / Whether the texts are similar
+ */
+export function isSimilar(a: string, b: string, threshold: number = 0.8): boolean {
+  const bigramsA = getBigrams(a);
+  const bigramsB = getBigrams(b);
+
+  if (bigramsA.size === 0 && bigramsB.size === 0) return true;
+  if (bigramsA.size === 0 || bigramsB.size === 0) return false;
+
+  let intersection = 0;
+  for (const [bigram, countA] of bigramsA) {
+    const countB = bigramsB.get(bigram) || 0;
+    intersection += Math.min(countA, countB);
+  }
+
+  const totalA = Array.from(bigramsA.values()).reduce((s, v) => s + v, 0);
+  const totalB = Array.from(bigramsB.values()).reduce((s, v) => s + v, 0);
+
+  // Dice coefficient: 2 * |intersection| / (|A| + |B|)
+  const dice = (2 * intersection) / (totalA + totalB);
+  return dice >= threshold;
+}
+
+/**
+ * 提取文本的 bigram 集合（带计数）
+ * Extract bigram multiset from text
+ */
+function getBigrams(text: string): Map<string, number> {
+  const normalized = text.toLowerCase().replace(/\s+/g, " ").trim();
+  const bigrams = new Map<string, number>();
+  for (let i = 0; i < normalized.length - 1; i++) {
+    const bigram = normalized.slice(i, i + 2);
+    bigrams.set(bigram, (bigrams.get(bigram) || 0) + 1);
+  }
+  return bigrams;
+}
+
+/**
  * 从消息中提取关键词/标签
  * Extract keywords/tags from a message
  */

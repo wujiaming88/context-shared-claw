@@ -32,6 +32,22 @@ export interface GlobalStats {
   totalOperations: number;
   startTime: string;
   lastUpdated: string;
+
+  // === 新增：效果评估字段 / New: evaluation metrics ===
+
+  /** 每个 Agent 的入池条目统计 / Per-agent pool entry stats */
+  poolByAgent: Record<string, { count: number; totalTokens: number }>;
+
+  /** assemble 命中统计 / Assemble hit statistics */
+  assembleHits: number;
+  assembleMisses: number;
+
+  /** 跨 Agent 流向：sourceAgent -> targetAgent -> count / Cross-agent flow */
+  crossAgentFlow: Record<string, Record<string, number>>;
+
+  /** Token 经济性 / Token economics */
+  totalSharedTokensInjected: number;
+  totalBudgetUsed: number;
 }
 
 export class StatsTracker {
@@ -46,19 +62,44 @@ export class StatsTracker {
     this.stats = this._load();
   }
 
-  /** 加载统计文件 / Load stats from file */
+  /** 加载统计文件（向后兼容）/ Load stats from file (backward compatible) */
   private _load(): GlobalStats {
     try {
       const content = fs.readFileSync(this.statsFile, "utf-8");
-      return JSON.parse(content);
-    } catch {
+      const raw = JSON.parse(content);
+      // 向后兼容：旧文件缺少新字段时用默认值
+      // Backward compatible: use defaults for missing fields in old stats files
       return {
-        agents: {},
-        totalOperations: 0,
-        startTime: new Date().toISOString(),
-        lastUpdated: new Date().toISOString(),
+        agents: raw.agents || {},
+        totalOperations: raw.totalOperations || 0,
+        startTime: raw.startTime || new Date().toISOString(),
+        lastUpdated: raw.lastUpdated || new Date().toISOString(),
+        poolByAgent: raw.poolByAgent || {},
+        assembleHits: raw.assembleHits || 0,
+        assembleMisses: raw.assembleMisses || 0,
+        crossAgentFlow: raw.crossAgentFlow || {},
+        totalSharedTokensInjected: raw.totalSharedTokensInjected || 0,
+        totalBudgetUsed: raw.totalBudgetUsed || 0,
       };
+    } catch {
+      return this._defaultStats();
     }
+  }
+
+  /** 默认统计数据 / Default stats */
+  private _defaultStats(): GlobalStats {
+    return {
+      agents: {},
+      totalOperations: 0,
+      startTime: new Date().toISOString(),
+      lastUpdated: new Date().toISOString(),
+      poolByAgent: {},
+      assembleHits: 0,
+      assembleMisses: 0,
+      crossAgentFlow: {},
+      totalSharedTokensInjected: 0,
+      totalBudgetUsed: 0,
+    };
   }
 
   /** 获取或创建 Agent 统计 / Get or create agent stats */
@@ -85,10 +126,49 @@ export class StatsTracker {
     const a = this._agent(agentId);
     a.assembleCount++;
     a.totalAssembleTokens += tokens;
-    if (sharedHit) a.sharedContextHits++;
-    else a.sharedContextMisses++;
+    if (sharedHit) {
+      a.sharedContextHits++;
+      this.stats.assembleHits++;
+    } else {
+      a.sharedContextMisses++;
+      this.stats.assembleMisses++;
+    }
+    this.stats.totalSharedTokensInjected += tokens;
     a.lastActivity = new Date().toISOString();
     this.stats.totalOperations++;
+    this._scheduleSave();
+  }
+
+  /** 记录入池条目统计 / Record pool entry stats */
+  recordPoolEntry(agentId: string, tokens: number): void {
+    if (!this.stats.poolByAgent[agentId]) {
+      this.stats.poolByAgent[agentId] = { count: 0, totalTokens: 0 };
+    }
+    this.stats.poolByAgent[agentId].count++;
+    this.stats.poolByAgent[agentId].totalTokens += tokens;
+    this._scheduleSave();
+  }
+
+  /**
+   * 记录跨 Agent 流向 / Record cross-agent flow
+   * @param sourceAgent - 条目来源 Agent / Source agent of the entry
+   * @param targetAgent - 请求者 Agent / Requesting agent
+   * @param count - 条目数 / Number of entries
+   */
+  recordCrossAgentFlow(sourceAgent: string, targetAgent: string, count: number): void {
+    if (!this.stats.crossAgentFlow[sourceAgent]) {
+      this.stats.crossAgentFlow[sourceAgent] = {};
+    }
+    if (!this.stats.crossAgentFlow[sourceAgent][targetAgent]) {
+      this.stats.crossAgentFlow[sourceAgent][targetAgent] = 0;
+    }
+    this.stats.crossAgentFlow[sourceAgent][targetAgent] += count;
+    this._scheduleSave();
+  }
+
+  /** 记录预算使用 / Record budget usage */
+  recordBudgetUsed(budget: number): void {
+    this.stats.totalBudgetUsed += budget;
     this._scheduleSave();
   }
 

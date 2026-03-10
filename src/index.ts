@@ -50,14 +50,15 @@ export function activate(api: any): void {
         properties: {
           command: {
             type: "string",
-            enum: ["pool_size", "recent_logs", "stats", "config", "compare"],
+            enum: ["pool_size", "recent_logs", "stats", "config", "compare", "evaluate"],
             description:
               "调试命令 / Debug command:\n" +
               "- pool_size: 共享上下文池大小 / Shared context pool size\n" +
               "- recent_logs: 最近的操作日志 / Recent operation logs\n" +
               "- stats: 各 Agent 的统计数据 / Per-agent statistics\n" +
               "- config: 当前配置 / Current configuration\n" +
-              "- compare: Token 消耗对比 / Token consumption comparison",
+              "- compare: Token 消耗对比 / Token consumption comparison\n" +
+              "- evaluate: 共享上下文效果评估报告 / Shared context effectiveness report",
           },
           limit: {
             type: "number",
@@ -172,10 +173,19 @@ export function activate(api: any): void {
               };
             }
 
+            case "evaluate": {
+              const report = await engine.evaluate();
+              return {
+                success: true,
+                data: report,
+                summary: report,
+              };
+            }
+
             default:
               return {
                 success: false,
-                error: `Unknown command: ${args.command}. Available: pool_size, recent_logs, stats, config, compare`,
+                error: `Unknown command: ${args.command}. Available: pool_size, recent_logs, stats, config, compare, evaluate`,
               };
           }
         } catch (err: any) {

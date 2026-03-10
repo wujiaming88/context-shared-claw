@@ -1,0 +1,13 @@
+{
+  "name": "context-shared-claw",
+  "version": "0.1.0",
+  "description": "OpenClaw Context Engine plugin for shared context across agents",
+  "main": "src/index.ts",
+  "keywords": ["openclaw", "context-engine", "shared-context"],
+  "license": "MIT",
+  "author": "wujiaming88",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wujiaming88/context-shared-claw"
+  }
+}

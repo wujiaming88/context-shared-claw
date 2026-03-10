@@ -1,0 +1,88 @@
+{
+  "name": "context-shared-claw",
+  "displayName": "Shared Context Engine",
+  "version": "0.1.0",
+  "description": "跨 Agent 共享上下文引擎 | Cross-agent shared context engine with local file and OpenViking support",
+  "entryPoint": "src/index.ts",
+  "provides": {
+    "contextEngine": true,
+    "tools": ["context_debug"]
+  },
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "agents": {
+        "type": "object",
+        "description": "Per-agent configuration / 每个 Agent 的配置",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "shared": {
+              "type": "boolean",
+              "description": "Enable shared context for this agent / 是否启用共享上下文",
+              "default": false
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": ["local", "openviking"]
+              },
+              "description": "Context sources in priority order / 上下文来源（按优先级排列）",
+              "default": ["local"]
+            },
+            "writeTo": {
+              "type": "string",
+              "enum": ["local", "openviking"],
+              "description": "Write destination (defaults to first source) / 写入目标（默认为第一个来源）"
+            }
+          }
+        }
+      },
+      "localDir": {
+        "type": "string",
+        "description": "Local shared context directory / 本地共享上下文目录",
+        "default": "~/.openclaw/shared-context"
+      },
+      "openviking": {
+        "type": "object",
+        "description": "OpenViking server configuration / OpenViking 服务器配置",
+        "properties": {
+          "host": {
+            "type": "string",
+            "default": "http://localhost:1933"
+          },
+          "apiKey": {
+            "type": "string"
+          },
+          "timeout": {
+            "type": "number",
+            "default": 5000
+          }
+        }
+      },
+      "compareMode": {
+        "type": "boolean",
+        "description": "Enable compare mode: generate both shared and non-shared context for comparison / 对比模式：同时生成有/无共享上下文以对比效果",
+        "default": false
+      },
+      "debugLevel": {
+        "type": "string",
+        "enum": ["off", "basic", "verbose"],
+        "description": "Debug logging level / 调试日志级别",
+        "default": "basic"
+      },
+      "maxContextEntries": {
+        "type": "number",
+        "description": "Maximum context entries to keep per agent / 每个 Agent 最大上下文条目数",
+        "default": 100
+      },
+      "defaultTokenBudget": {
+        "type": "number",
+        "description": "Default token budget for assembly / 默认 assemble token 预算",
+        "default": 4000
+      }
+    },
+    "additionalProperties": false
+  }
+}

@@ -237,6 +237,10 @@ export class SharedContextEngine {
     this.stats.recordPoolEntry(agentId, entry.tokens);
 
     return passthrough;
+    } catch (err: any) {
+      this.apiLogger?.error?.(`[context-shared-claw] ingest ERROR: ${err?.message || err}`);
+      return { ingested: false };
+    }
   }
 
   /**
@@ -264,11 +268,10 @@ export class SharedContextEngine {
     }
 
     return passthrough;
-    } catch (err: any) {
-      this.apiLogger?.error?.(`[context-shared-claw] ingest ERROR: ${err?.message || err}`);
-      return { ingested: false };
-    }
   }
+
+  /**
+   * afterTurn — 轮次结束
    * 始终委托 legacy + 共享 Agent 清理共享池
    */
   async afterTurn(params: {

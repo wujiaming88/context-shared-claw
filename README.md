@@ -2,7 +2,35 @@
 
 Cross-agent shared context engine for [OpenClaw](https://github.com/openclaw/openclaw) — automatically share working context across multiple agents to improve team collaboration.
 
+> **Turn 21 isolated AI agents into a connected knowledge network — at 0.23% cost overhead.**
+
 > 📖 [中文文档 / Chinese Documentation](./README.zh-CN.md)
+
+---
+
+## Why
+
+AI agents are islands. Each conversation is a silo. When you run multiple agents, they can't share knowledge with each other — like a team where no one communicates.
+
+**context-shared-claw** solves this by creating a shared context layer that automatically flows knowledge between agents:
+
+```
+Before:  Agent A knows X  →  only Agent A knows X
+After:   Agent A knows X  →  Agent B, C, D also get X (automatically)
+```
+
+### Real-World Results
+
+| Metric | Value | Meaning |
+|--------|-------|---------|
+| Hit Rate | **54.2%** | Over half of conversations benefit from cross-agent knowledge |
+| Budget Overhead | **0.23%** | Near-zero cost — doesn't crowd out main conversation context |
+| Avg Injection | **1,042 tokens** | Enough to transfer key decisions, not enough to add noise |
+| Active Agents | **23** | Broad coverage across all agent sessions |
+| Cross-Agent Flows | **53** | Rich knowledge network forming between agents |
+| Pool Size | **90 entries** | Growing collective memory |
+
+> **Low cost (0.23% budget), high yield (54% hit rate), broad coverage (23 agents / 53 flows).**
 
 ---
 
@@ -10,11 +38,14 @@ Cross-agent shared context engine for [OpenClaw](https://github.com/openclaw/ope
 
 - [Features](#features)
 - [Architecture](#architecture)
+- [How It Works](#how-it-works)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Ingestion Filters](#ingestion-filters)
 - [Debug Tools](#debug-tools)
 - [Evaluation](#evaluation)
+- [Risks & Mitigations](#risks--mitigations)
+- [Roadmap](#roadmap)
 - [Testing](#testing)
 - [License](#license)
 
@@ -24,75 +55,112 @@ Cross-agent shared context engine for [OpenClaw](https://github.com/openclaw/ope
 
 | Feature | Description |
 |---------|-------------|
+| **Wrapper Mode** | Wraps the legacy context engine — non-shared agents have zero interference |
+| **afterTurn Writing** | Writes to shared pool after each turn (Runtime doesn't call `ingest` when `ownsCompaction=false`) |
+| **Wildcard Config** | Use `"*"` to match all agents — no need to know agent IDs upfront |
 | **Write Isolation** | Each agent writes only to its own directory — no contention |
 | **Read Merge** | Assemble merges all agents' entries, excluding self |
 | **Atomic Writes** | Write to temp file then rename — prevents partial-write corruption |
 | **Elastic Budget** | Shared context budget dynamically adjusts based on used tokens |
-| **Ingestion Filters** | Auto-filter short messages, heartbeats, announces, duplicates |
+| **Ingestion Filters** | Auto-filter system messages, short messages, heartbeats, announces, duplicates |
+| **Multimodal Support** | Handles `AgentMessage.content` as string or `ContentPart[]` |
 | **Tool Output Truncation** | Auto-truncate tool output exceeding 2000 tokens |
-| **Keyword Search** | Bigram-based keyword matching with relevance ranking |
-| **Evaluation Report** | Pool health, hit rate, token economics, cross-agent flow |
-| **OpenViking Support** | Optional OpenViking server integration for distributed sharing |
-| **Compare Mode** | Generate both with/without shared context to compare token usage |
+| **Compare Mode** | Generate with/without shared context comparison for token analysis |
+| **OpenViking Support** | Optional OpenViking integration for semantic search & distributed sharing |
 
 ---
 
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                    SharedContextEngine                      │
-│                                                            │
-│  ingest()          assemble()           compact()          │
-│  ┌──────┐          ┌──────────┐         ┌────────┐        │
-│  │Filter│──write──▶│Read Merge│──inject──│Cleanup │        │
-│  │ Chain │          │(exclude  │          │(quota  │        │
-│  └──────┘          │  self)   │          │ based) │        │
-│                    └──────────┘          └────────┘        │
-└─────────────────────────┬──────────────────────────────────┘
-                          │
-          ┌───────────────┼───────────────┐
-          ▼               ▼               ▼
-   ┌─────────────┐ ┌─────────────┐ ┌──────────────┐
-   │ LocalSource  │ │ LocalSource  │ │  OpenViking   │
-   │  (agentA/)   │ │  (agentB/)   │ │  (HTTP API)   │
-   │ _index.json  │ │ _index.json  │ │  L0/L1/L2     │
-   └─────────────┘ └─────────────┘ └──────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│                  SharedContextEngine (Wrapper Mode)            │
+│                                                               │
+│  Non-shared Agent → pass-through (100% legacy behavior)       │
+│  Shared Agent     → pass-through + shared context injection   │
+│                                                               │
+│  afterTurn()         assemble()              compact()        │
+│  ┌──────────┐        ┌──────────────┐        ┌─────────┐     │
+│  │ Extract   │        │ Pass-through │        │ Runtime  │     │
+│  │ new msgs  │──write─│ + inject     │──read──│ handles  │     │
+│  │ to pool   │        │ shared ctx   │        │ + cleanup│     │
+│  └──────────┘        └──────────────┘        └─────────┘     │
+└───────────────────────────┬───────────────────────────────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            ▼               ▼               ▼
+     ┌─────────────┐ ┌─────────────┐ ┌──────────────┐
+     │ LocalSource  │ │ LocalSource  │ │  OpenViking   │
+     │  (agentA/)   │ │  (agentB/)   │ │  (HTTP API)   │
+     │ _index.json  │ │ _index.json  │ │  semantic DB   │
+     └─────────────┘ └─────────────┘ └──────────────┘
 ```
+
+### Hook Delegation
+
+| Hook | Non-shared Agent | Shared Agent |
+|------|-----------------|--------------|
+| `bootstrap` | no-op | log session start |
+| `ingest` | pass-through | pass-through (no-op, Runtime handles persistence) |
+| `afterTurn` | no-op | **extract new messages → write to shared pool** |
+| `assemble` | pass-through (return original messages) | pass-through + **inject shared context via `systemPromptAddition`** |
+| `compact` | delegated to Runtime (`ownsCompaction=false`) | delegated to Runtime + cleanup shared pool |
 
 ### Storage Layout
 
 ```
-shared-context/entries/
-├── agentA/
-│   ├── _index.json          ← agentA exclusive write
-│   └── agentA-*.json        ← individual entry files (debug)
-├── agentB/
-│   ├── _index.json          ← agentB exclusive write
-│   └── agentB-*.json
-└── ...
+~/.openclaw/shared-context/
+├── entries/
+│   ├── <agentId-1>/
+│   │   └── _index.json      ← agent-1 exclusive write
+│   ├── <agentId-2>/
+│   │   └── _index.json      ← agent-2 exclusive write
+│   └── ...
+├── debug/
+│   ├── 2026-03-10.jsonl     ← daily operation logs
+│   └── ...
+└── stats.json                ← cumulative statistics (persists across restarts)
 ```
 
-**Key principles:**
+---
 
-- **Write Isolation**: Each agent only writes to its own `_index.json`
-- **Read Merge**: `assemble()` iterates all directories, excluding self
-- **Atomic Write**: `writeFileSync` → tmp → `renameSync` → final
-- **Elastic Budget**: `sharedBudget = min(ratio × budget, (budget − used) × 0.8)`
+## How It Works
+
+### 1. Writing: afterTurn
+
+After each conversation turn, the engine extracts new messages and writes them to the shared pool:
+
+```
+User sends message → LLM responds → afterTurn() fires
+  → Extract messages after prePromptMessageCount
+  → Filter: skip system, short (<50 chars), duplicates (>80% similar)
+  → Only keep user & assistant messages
+  → Write to agent's _index.json (atomic: tmp + rename)
+```
+
+### 2. Reading: assemble
+
+When assembling context for a model call, the engine injects shared context from other agents:
+
+```
+assemble() called
+  → Calculate elastic budget: min(ratio × budget, (budget − used) × 0.8)
+  → Read all agents' _index.json (excluding self)
+  → Select entries within budget
+  → Return: original messages + systemPromptAddition with shared context
+```
+
+### 3. Why afterTurn instead of ingest?
+
+When `ownsCompaction=false` (our case), the OpenClaw Runtime manages message persistence itself and **does not call `ingest()`**. It only calls `assemble()` for context building and `afterTurn()` for post-turn lifecycle. So we use `afterTurn` to populate the shared pool.
 
 ---
 
 ## Installation
 
-Place the plugin in OpenClaw's extensions directory:
-
 ```bash
-# Option A: Clone directly into extensions
 cd ~/.openclaw/extensions
 git clone https://github.com/wujiaming88/context-shared-claw.git
-
-# Option B: Symlink from your project
-ln -s /path/to/context-shared-claw ~/.openclaw/extensions/context-shared-claw
 ```
 
 OpenClaw uses jiti for JIT TypeScript compilation — no build step needed.
@@ -101,9 +169,9 @@ OpenClaw uses jiti for JIT TypeScript compilation — no build step needed.
 
 ## Configuration
 
-Add plugin configuration to your OpenClaw config file (`~/.openclaw/openclaw.json`):
+Add to `~/.openclaw/openclaw.json`:
 
-```json
+```json5
 {
   "plugins": {
     "entries": {
@@ -111,32 +179,15 @@ Add plugin configuration to your OpenClaw config file (`~/.openclaw/openclaw.jso
         "enabled": true,
         "config": {
           "agents": {
-            "main": {
-              "shared": true,
-              "sources": ["local"],
-              "writeTo": "local"
-            },
-            "waicode": {
+            // Use "*" to match all agents (recommended)
+            // Session IDs are UUIDs, not agent names
+            "*": {
               "shared": true,
               "sources": ["local"]
-            },
-            "wairesearch": {
-              "shared": true,
-              "sources": ["local", "openviking"]
             }
           },
-          "localDir": "~/.openclaw/shared-context",
-          "openviking": {
-            "host": "http://localhost:1933",
-            "apiKey": "your-api-key",
-            "timeout": 5000
-          },
-          "compareMode": false,
-          "debugLevel": "basic",
-          "maxContextEntries": 100,
-          "defaultTokenBudget": 4000,
-          "sharedBudgetRatio": 0.3,
-          "announceProtectTTL": 86400000
+          "compareMode": true,
+          "debugLevel": "verbose"
         }
       }
     },
@@ -147,188 +198,152 @@ Add plugin configuration to your OpenClaw config file (`~/.openclaw/openclaw.jso
 }
 ```
 
-> **Note**: Plugin config goes under `plugins.entries.<id>.config`, not directly under `plugins`. The `plugins.slots.contextEngine` tells OpenClaw to use this plugin as the active Context Engine, replacing the default `legacy` engine.
-```
+> **Important**: Config goes under `plugins.entries.<id>.config` (accessed via `api.pluginConfig`, not `api.config`). The `plugins.slots.contextEngine` activates this as the global context engine.
 
 ### Configuration Fields
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `agents` | `object` | `{}` | Per-agent sharing config |
+| `agents` | `object` | `{}` | Per-agent sharing config. Use `"*"` as wildcard |
 | `agents.*.shared` | `boolean` | `false` | Enable shared context for this agent |
 | `agents.*.sources` | `string[]` | `["local"]` | Context sources in priority order |
 | `agents.*.writeTo` | `string` | first source | Write destination |
 | `localDir` | `string` | `~/.openclaw/shared-context` | Local storage directory |
 | `openviking.host` | `string` | `http://localhost:1933` | OpenViking server URL |
 | `openviking.apiKey` | `string` | — | OpenViking API key |
-| `openviking.timeout` | `number` | `5000` | Request timeout (ms) |
-| `compareMode` | `boolean` | `false` | Enable compare mode (with/without shared context) |
-| `debugLevel` | `string` | `"basic"` | Log level: `off` / `basic` / `verbose` |
-| `maxContextEntries` | `number` | `100` | Max entries to keep |
+| `compareMode` | `boolean` | `false` | Log with/without shared context token comparison |
+| `debugLevel` | `string` | `"basic"` | `off` / `basic` / `verbose` |
+| `maxContextEntries` | `number` | `100` | Max entries per agent to keep |
 | `defaultTokenBudget` | `number` | `4000` | Default token budget |
 | `sharedBudgetRatio` | `number` | `0.3` | Max ratio of budget for shared context (0–1) |
-| `announceProtectTTL` | `number` | `86400000` | Announce protection TTL (ms) |
 
 ---
 
 ## Ingestion Filters
 
-Messages are filtered before entering the shared pool to improve signal-to-noise ratio:
+Messages are filtered before entering the shared pool:
 
 | # | Rule | Condition | Behavior |
 |:-:|------|-----------|----------|
-| 1 | Heartbeat | `isHeartbeat === true` | Skip |
-| 2 | Empty content | `content.trim() === ""` | Skip |
-| 3 | Announce | Contains `[Internal task completion event]` or related metadata | Skip (managed by Runtime) |
-| 4 | Short content | `content.length < 50` | Skip |
-| 5 | Dedup | Dice similarity > 80% with recent 5 entries | Skip |
-| 6 | Tool truncation | `role === "tool"` and tokens > 2000 | Truncate to ~2000 tokens |
+| 1 | System messages | `role === "system"` | Skip |
+| 2 | Internal prompts | Contains "Session Startup sequence" | Skip |
+| 3 | Announce | Contains `[Internal task completion event]` | Skip |
+| 4 | Non-conversation | Role is not `user` or `assistant` | Skip |
+| 5 | Short content | `content.length < 50` | Skip |
+| 6 | Dedup | Dice similarity > 80% with recent 5 entries | Skip |
+| 7 | Tool truncation | `role === "tool"` and tokens > 2000 | Truncate to ~2000 tokens |
 
 ---
 
 ## Debug Tools
 
-The plugin registers a `context_debug` agent tool with these subcommands:
-
-### `pool_size` — Pool Size
+The plugin registers a `context_debug` agent tool:
 
 ```json
-{ "command": "pool_size" }
-// → { "local": 42, "openviking": 0 }
+{ "command": "stats" }              // Global or per-agent statistics
+{ "command": "pool_size" }          // Pool entry counts
+{ "command": "recent_logs" }        // Recent operation logs
+{ "command": "evaluate" }           // Full evaluation report
+{ "command": "compare" }            // Token comparison data
+{ "command": "config" }             // Current configuration
 ```
 
-### `recent_logs` — Recent Operation Logs
+### CLI
 
-```json
-{ "command": "recent_logs", "limit": 10, "agentId": "waicode" }
+```bash
+npx tsx src/cli.ts evaluate
+npx tsx src/cli.ts stats
+npx tsx src/cli.ts pool-size
 ```
-
-### `stats` — Statistics
-
-```json
-{ "command": "stats" }
-{ "command": "stats", "agentId": "waicode" }
-```
-
-### `config` — Current Configuration
-
-```json
-{ "command": "config" }
-```
-
-### `compare` — Token Comparison
-
-```json
-{ "command": "compare", "limit": 5 }
-```
-
-### `evaluate` — Evaluation Report
-
-```json
-{ "command": "evaluate" }
-```
-
-See [Evaluation](#evaluation) for report details.
 
 ---
 
 ## Evaluation
 
-Use the `evaluate` command to generate a full effectiveness report:
+### Quick Check
 
-```
-📊 Shared Context Evaluation Report
-─────────────────────────────────────
-
-Pool Health:
-  Total entries: 42 | Effective (>50tok): 38 (90.5%)
-  Average entry size: 120 tok
-  SNR score: 90.5% (recommended >70%)
-
-Usage:
-  Total assemble calls: 156
-  Hits (shared context injected): 132 (84.6%)
-  Misses: 24 (15.4%)
-
-Token Economics:
-  Total shared tokens injected: 15,840
-  Budget utilization: 2.54% (configured max: 30%)
-
-Cross-Agent Flow:
-  waicode → main: 45 entries used
-  wairesearch → waicode: 23 entries used
-  main → wairesearch: 12 entries used
+```bash
+cat ~/.openclaw/shared-context/stats.json | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+total = d['assembleHits'] + d['assembleMisses']
+hits = d['assembleHits']
+print(f'Hit Rate: {hits}/{total} = {hits/total*100:.1f}%' if total else 'No data')
+print(f'Tokens Injected: {d[\"totalSharedTokensInjected\"]}')
+print(f'Budget Overhead: {d[\"totalSharedTokensInjected\"]/d[\"totalBudgetUsed\"]*100:.2f}%' if d['totalBudgetUsed'] else 'N/A')
+print(f'Avg per Hit: {d[\"totalSharedTokensInjected\"]/hits:.0f} tokens' if hits else 'N/A')
+print(f'Active Agents: {len(d[\"agents\"])}')
+print(f'Pool Entries: {sum(p[\"count\"] for p in d[\"poolByAgent\"].values())}')
+print(f'Cross-Agent Flows: {sum(len(t) for t in d[\"crossAgentFlow\"].values())}')
+"
 ```
 
 ### Metrics
 
-| Metric | Description |
-|--------|-------------|
-| **Total Entries** | All entries in the shared pool |
-| **Effective Entries** | Entries with >50 tokens, filtering out residual short entries |
-| **SNR Score** | Effective entry ratio — recommended >70% |
-| **Hit Rate** | Rate of successful shared context injection during assemble |
-| **Token Economics** | Actual shared token usage vs total budget |
-| **Cross-Agent Flow** | Which agents' context is consumed by which agents |
+| Metric | Description | Target |
+|--------|-------------|--------|
+| **Hit Rate** | % of assemble calls that injected shared context | >30% |
+| **Budget Overhead** | Shared tokens as % of total budget | <5% |
+| **Avg per Hit** | Tokens injected per successful hit | <2,000 |
+| **Cross-Agent Flows** | Number of distinct agent→agent knowledge paths | Growing |
+
+### Compare Mode Logs
+
+When `compareMode: true`, each assemble logs a comparison:
+
+```json
+{
+  "tokensWithShared": 995,
+  "tokensWithoutShared": 253,
+  "tokenDifference": 742,
+  "percentageIncrease": "293.3"
+}
+```
+
+Full evaluation plan: [docs/evaluation-plan.md](./docs/evaluation-plan.md)
 
 ---
 
-## CLI
+## Risks & Mitigations
 
-The plugin includes a CLI for direct terminal access to debug tools:
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| **Privacy leakage** | 🔴 High | Filter sensitive content before pool; use per-agent source config |
+| **Error propagation** | 🔴 High | Agent A's mistakes spread to all agents via shared pool |
+| **Noise injection** | 🟡 Medium | Ingestion filters + future semantic search (OpenViking) |
+| **Context confusion** | 🟡 Medium | Shared context clearly marked with `=== Shared Context ===` delimiters |
+| **Storage growth** | 🟢 Low | `maxContextEntries` cap + cleanup in afterTurn/compact |
+| **Latency** | 🟢 Low | Currently <1ms (local file I/O) |
 
-```bash
-# Run directly with tsx
-npx tsx src/cli.ts <command>
+---
 
-# Or install globally
-npm link
-context-shared-claw <command>
-```
+## Roadmap
 
-### Commands
-
-```bash
-context-shared-claw evaluate              # Evaluation report
-context-shared-claw stats                 # Statistics
-context-shared-claw stats --agent waicode # Stats for specific agent
-context-shared-claw pool-size             # Pool size
-context-shared-claw recent-logs           # Recent operation logs
-context-shared-claw recent-logs --limit 5 # Last 5 logs
-context-shared-claw config                # Current configuration
-```
-
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `CONTEXT_SHARED_CONFIG` | Custom config file path (overrides auto-detection) |
-
-Config is auto-detected from: OpenClaw plugin dir → shared-context dir → OpenClaw main config.
+| Phase | Status | Description |
+|-------|--------|-------------|
+| Local source | ✅ Done | File-based shared pool, time-ordered retrieval |
+| Wrapper mode | ✅ Done | Non-shared agents unaffected, zero regression |
+| Evaluation framework | ✅ Done | Stats, compare mode, evaluation reports |
+| OpenViking integration | 🔜 Next | Semantic vector search, distributed storage, multi-machine |
+| Privacy filters | 📋 Planned | Auto-detect and redact sensitive content |
+| Semantic dedup | 📋 Planned | Vector-based dedup replacing bigram similarity |
 
 ---
 
 ## Testing
 
-Tests use Node.js built-in `node:test` and `node:assert`, run via tsx:
-
 ```bash
-# Install dev dependencies
 npm install -D tsx
-
-# Run all tests
 npx tsx --test tests/*.test.ts
 ```
 
-### Test Suites
-
 | File | Tests | Coverage |
 |------|:-----:|----------|
-| `ingest-filter.test.ts` | 7 | Short content, empty, normal, heartbeat, announce, tool truncation, dedup |
-| `write-isolation.test.ts` | 4 | Agent directory isolation, cross-agent read, self-exclusion, rapid writes |
-| `elastic-budget.test.ts` | 3 | Normal budget, tight budget, exhausted budget |
+| `ingest-filter.test.ts` | 7 | Short, empty, normal, heartbeat, announce, tool truncation, dedup |
+| `write-isolation.test.ts` | 4 | Directory isolation, cross-agent read, self-exclusion, rapid writes |
+| `elastic-budget.test.ts` | 3 | Normal, tight, exhausted budget |
 | `atomic-write.test.ts` | 2 | File parseable, no .tmp residue |
-| `evaluate.test.ts` | 2 | Report format, empty pool defaults |
+| `evaluate.test.ts` | 2 | Report format, empty pool |
 | `search.test.ts` | 6 | isSimilar (4) + searchEntries (2) |
 | **Total** | **24** | |
 

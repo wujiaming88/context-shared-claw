@@ -2,7 +2,35 @@
 
 跨 Agent 共享上下文引擎 —— 让多个 [OpenClaw](https://github.com/openclaw/openclaw) Agent 自动共享工作上下文，提升团队协作质量。
 
+> **让 21 个孤立的 AI Agent 变成互联的知识网络 —— 仅 0.23% 的成本开销。**
+
 > 📖 [English Documentation](./README.md)
+
+---
+
+## 为什么需要
+
+AI Agent 都是孤岛。每个会话都是独立的。当你运行多个 Agent 时，它们无法共享知识 —— 就像一个团队里没人交流。
+
+**context-shared-claw** 通过创建共享上下文层，让知识在 Agent 之间自动流动：
+
+```
+之前:  Agent A 知道 X  →  只有 Agent A 知道 X
+之后:  Agent A 知道 X  →  Agent B、C、D 也自动获得 X
+```
+
+### 实测数据
+
+| 指标 | 值 | 含义 |
+|------|-----|------|
+| 命中率 | **54.2%** | 超过一半的对话受益于跨 Agent 知识 |
+| 占预算比 | **0.23%** | 几乎零成本，不挤占主对话空间 |
+| 每次命中 | **1,042 tokens** | 足够传递关键决策，不会过度注入噪声 |
+| 活跃 Agent | **23** | 广泛覆盖所有 Agent 会话 |
+| 跨 Agent 流向 | **53** | Agent 间形成丰富的知识网络 |
+| 共享池条目 | **90** | 持续增长的集体记忆 |
+
+> **低成本（0.23% 预算），高收益（54% 命中），广覆盖（23 Agent / 53 流向）。**
 
 ---
 
@@ -10,11 +38,14 @@
 
 - [功能特性](#功能特性)
 - [架构](#架构)
+- [工作原理](#工作原理)
 - [安装](#安装)
 - [配置](#配置)
 - [入池过滤规则](#入池过滤规则)
 - [调试工具](#调试工具)
 - [效果评估](#效果评估)
+- [风险与应对](#风险与应对)
+- [路线图](#路线图)
 - [测试](#测试)
 - [许可](#许可)
 
@@ -24,74 +55,112 @@
 
 | 功能 | 说明 |
 |------|------|
+| **包装模式** | 包装 legacy 引擎 —— 非共享 Agent 完全不受影响 |
+| **afterTurn 写入** | 每轮对话结束后写入共享池（`ownsCompaction=false` 时 Runtime 不调用 `ingest`） |
+| **通配符配置** | 用 `"*"` 匹配所有 Agent，无需预知 Agent ID |
 | **写隔离** | 每个 Agent 只写自己的目录，无写冲突 |
 | **读合并** | assemble 时合并所有 Agent 的条目（排除自身） |
 | **原子写入** | 先写临时文件再 rename，不会出现半写损坏 |
 | **弹性预算** | 共享上下文根据已用 Token 自动伸缩预算 |
-| **入池过滤** | 短消息、心跳、Announce、重复内容自动过滤 |
+| **入池过滤** | 系统消息、短消息、心跳、Announce、重复内容自动过滤 |
+| **多模态支持** | 兼容 `AgentMessage.content` 为字符串或 `ContentPart[]` |
 | **工具输出截断** | role=tool 且超 2000 token 时自动截断 |
-| **关键词搜索** | 基于 bigram 的关键词匹配和相关性排序 |
-| **效果评估** | 池子健康度、命中率、Token 经济性、跨 Agent 流向 |
-| **OpenViking 支持** | 可选对接 OpenViking 服务端进行分布式上下文共享 |
 | **对比模式** | 同时生成有/无共享上下文的对比数据，量化收益 |
+| **OpenViking 支持** | 可选对接 OpenViking，实现语义搜索和分布式共享 |
 
 ---
 
 ## 架构
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                    SharedContextEngine                      │
-│                                                            │
-│  ingest()          assemble()           compact()          │
-│  ┌──────┐          ┌──────────┐         ┌────────┐        │
-│  │过滤链 │──写入──▶│ 读取合并  │──注入──│ 清理   │        │
-│  │      │          │(排除自身) │          │(按配额) │        │
-│  └──────┘          └──────────┘          └────────┘        │
-└─────────────────────────┬──────────────────────────────────┘
-                          │
-          ┌───────────────┼───────────────┐
-          ▼               ▼               ▼
-   ┌─────────────┐ ┌─────────────┐ ┌──────────────┐
-   │ LocalSource  │ │ LocalSource  │ │  OpenViking   │
-   │  (agentA/)   │ │  (agentB/)   │ │  (HTTP API)   │
-   │ _index.json  │ │ _index.json  │ │  L0/L1/L2     │
-   └─────────────┘ └─────────────┘ └──────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│                SharedContextEngine（包装模式）                   │
+│                                                               │
+│  非共享 Agent → 透传（100% legacy 行为）                        │
+│  共享 Agent   → 透传 + 注入共享上下文                            │
+│                                                               │
+│  afterTurn()         assemble()              compact()        │
+│  ┌──────────┐        ┌──────────────┐        ┌─────────┐     │
+│  │ 提取本轮  │        │ 透传原始消息  │        │ Runtime  │     │
+│  │ 新消息    │──写入──│ + 注入共享    │──读取──│ 负责压缩  │     │
+│  │ 到共享池  │        │ 上下文       │        │ + 清理   │     │
+│  └──────────┘        └──────────────┘        └─────────┘     │
+└───────────────────────────┬───────────────────────────────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            ▼               ▼               ▼
+     ┌─────────────┐ ┌─────────────┐ ┌──────────────┐
+     │ LocalSource  │ │ LocalSource  │ │  OpenViking   │
+     │  (agentA/)   │ │  (agentB/)   │ │  (HTTP API)   │
+     │ _index.json  │ │ _index.json  │ │   语义数据库   │
+     └─────────────┘ └─────────────┘ └──────────────┘
 ```
+
+### 钩子委托链
+
+| 钩子 | 非共享 Agent | 共享 Agent |
+|------|-------------|-----------|
+| `bootstrap` | no-op | 记录会话启动 |
+| `ingest` | 透传 | 透传（no-op，Runtime 处理持久化） |
+| `afterTurn` | no-op | **提取新消息 → 写入共享池** |
+| `assemble` | 透传（返回原始消息） | 透传 + **通过 `systemPromptAddition` 注入共享上下文** |
+| `compact` | 委托 Runtime（`ownsCompaction=false`） | 委托 Runtime + 清理共享池 |
 
 ### 存储结构
 
 ```
-shared-context/entries/
-├── agentA/
-│   ├── _index.json          ← agentA 独占写入
-│   └── agentA-*.json        ← 单条目文件（调试用）
-├── agentB/
-│   ├── _index.json          ← agentB 独占写入
-│   └── agentB-*.json
-└── ...
+~/.openclaw/shared-context/
+├── entries/
+│   ├── <agentId-1>/
+│   │   └── _index.json      ← agent-1 独占写入
+│   ├── <agentId-2>/
+│   │   └── _index.json      ← agent-2 独占写入
+│   └── ...
+├── debug/
+│   ├── 2026-03-10.jsonl     ← 每日操作日志
+│   └── ...
+└── stats.json                ← 累计统计（跨重启保留）
 ```
 
-**核心原则：**
+---
 
-- **写隔离**：每个 Agent 只写自己的 `_index.json`
-- **读合并**：`assemble()` 遍历所有目录，排除自身
-- **原子写入**：`writeFileSync` → tmp → `renameSync` → 最终文件
-- **弹性预算**：`sharedBudget = min(ratio × budget, (budget − used) × 0.8)`
+## 工作原理
+
+### 1. 写入：afterTurn
+
+每轮对话结束后，引擎提取新增消息写入共享池：
+
+```
+用户发消息 → LLM 回复 → afterTurn() 触发
+  → 提取 prePromptMessageCount 之后的新消息
+  → 过滤：跳过系统消息、短内容(<50字)、重复(>80%相似)
+  → 只保留 user 和 assistant 角色
+  → 原子写入 agent 的 _index.json（tmp + rename）
+```
+
+### 2. 读取：assemble
+
+组装模型上下文时，注入其他 Agent 的共享上下文：
+
+```
+assemble() 被调用
+  → 计算弹性预算：min(ratio × budget, (budget − used) × 0.8)
+  → 读取所有 agent 的 _index.json（排除自身）
+  → 在预算内选择条目
+  → 返回：原始消息 + systemPromptAddition（包含共享上下文）
+```
+
+### 3. 为什么用 afterTurn 而不是 ingest？
+
+当 `ownsCompaction=false` 时，OpenClaw Runtime 自己管理消息持久化，**不会调用 `ingest()`**。它只调用 `assemble()` 组装上下文和 `afterTurn()` 处理轮次结束。所以我们在 `afterTurn` 中填充共享池。
 
 ---
 
 ## 安装
 
-将插件放到 OpenClaw 的扩展目录下：
-
 ```bash
-# 方式 A：直接 clone 到扩展目录
 cd ~/.openclaw/extensions
 git clone https://github.com/wujiaming88/context-shared-claw.git
-
-# 方式 B：符号链接
-ln -s /path/to/context-shared-claw ~/.openclaw/extensions/context-shared-claw
 ```
 
 OpenClaw 使用 jiti 即时编译 TypeScript，无需构建步骤。
@@ -100,9 +169,9 @@ OpenClaw 使用 jiti 即时编译 TypeScript，无需构建步骤。
 
 ## 配置
 
-在 OpenClaw 配置文件（`~/.openclaw/openclaw.json`）中添加插件配置：
+在 `~/.openclaw/openclaw.json` 中添加：
 
-```json
+```json5
 {
   "plugins": {
     "entries": {
@@ -110,32 +179,15 @@ OpenClaw 使用 jiti 即时编译 TypeScript，无需构建步骤。
         "enabled": true,
         "config": {
           "agents": {
-            "main": {
-              "shared": true,
-              "sources": ["local"],
-              "writeTo": "local"
-            },
-            "waicode": {
+            // 用 "*" 匹配所有 Agent（推荐）
+            // Session ID 是 UUID，不是 Agent 名称
+            "*": {
               "shared": true,
               "sources": ["local"]
-            },
-            "wairesearch": {
-              "shared": true,
-              "sources": ["local", "openviking"]
             }
           },
-          "localDir": "~/.openclaw/shared-context",
-          "openviking": {
-            "host": "http://localhost:1933",
-            "apiKey": "your-api-key",
-            "timeout": 5000
-          },
-          "compareMode": false,
-          "debugLevel": "basic",
-          "maxContextEntries": 100,
-          "defaultTokenBudget": 4000,
-          "sharedBudgetRatio": 0.3,
-          "announceProtectTTL": 86400000
+          "compareMode": true,
+          "debugLevel": "verbose"
         }
       }
     },
@@ -146,185 +198,151 @@ OpenClaw 使用 jiti 即时编译 TypeScript，无需构建步骤。
 }
 ```
 
-> **注意**：插件配置放在 `plugins.entries.<id>.config` 下，不是直接放在 `plugins` 下。`plugins.slots.contextEngine` 告诉 OpenClaw 使用此插件作为上下文引擎，替换默认的 `legacy` 引擎。
-```
+> **注意**：配置在 `plugins.entries.<id>.config` 下（通过 `api.pluginConfig` 获取，不是 `api.config`）。`plugins.slots.contextEngine` 激活此插件为全局上下文引擎。
 
-### 配置字段说明
+### 配置字段
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `agents` | `object` | `{}` | 每个 Agent 的共享配置 |
+| `agents` | `object` | `{}` | Agent 共享配置，支持 `"*"` 通配符 |
 | `agents.*.shared` | `boolean` | `false` | 是否启用共享上下文 |
 | `agents.*.sources` | `string[]` | `["local"]` | 上下文来源（按优先级排列） |
 | `agents.*.writeTo` | `string` | 首个 source | 写入目标 |
 | `localDir` | `string` | `~/.openclaw/shared-context` | 本地存储目录 |
 | `openviking.host` | `string` | `http://localhost:1933` | OpenViking 服务地址 |
 | `openviking.apiKey` | `string` | — | OpenViking API 密钥 |
-| `openviking.timeout` | `number` | `5000` | 请求超时（毫秒） |
-| `compareMode` | `boolean` | `false` | 对比模式：同时生成有/无共享上下文的对比数据 |
+| `compareMode` | `boolean` | `false` | 对比模式：记录有/无共享上下文的 Token 对比 |
 | `debugLevel` | `string` | `"basic"` | 日志级别：`off` / `basic` / `verbose` |
-| `maxContextEntries` | `number` | `100` | 最大保留条目数 |
+| `maxContextEntries` | `number` | `100` | 每个 Agent 最大保留条目数 |
 | `defaultTokenBudget` | `number` | `4000` | 默认 Token 预算 |
 | `sharedBudgetRatio` | `number` | `0.3` | 共享上下文占总预算的最大比例（0–1） |
-| `announceProtectTTL` | `number` | `86400000` | Announce 保护 TTL（毫秒） |
 
 ---
 
 ## 入池过滤规则
 
-消息在写入共享池前会经过多级过滤，提高信噪比：
+消息在写入共享池前经过多级过滤：
 
 | 序号 | 规则 | 条件 | 行为 |
 |:---:|------|------|------|
-| 1 | 心跳过滤 | `isHeartbeat === true` | 跳过 |
-| 2 | 空内容 | `content.trim() === ""` | 跳过 |
-| 3 | Announce 过滤 | 包含 `[Internal task completion event]` 或相关元数据 | 跳过（由 Runtime 管理） |
-| 4 | 短内容 | `content.length < 50` | 跳过 |
-| 5 | 去重 | 与最近 5 条条目的 Dice 相似度 > 80% | 跳过 |
-| 6 | 工具截断 | `role === "tool"` 且 token > 2000 | 截断至约 2000 token |
+| 1 | 系统消息 | `role === "system"` | 跳过 |
+| 2 | 内部提示 | 包含 "Session Startup sequence" | 跳过 |
+| 3 | Announce | 包含 `[Internal task completion event]` | 跳过 |
+| 4 | 非对话消息 | role 不是 `user` 或 `assistant` | 跳过 |
+| 5 | 短内容 | `content.length < 50` | 跳过 |
+| 6 | 去重 | 与最近 5 条的 Dice 相似度 > 80% | 跳过 |
+| 7 | 工具截断 | `role === "tool"` 且 token > 2000 | 截断至约 2000 token |
 
 ---
 
 ## 调试工具
 
-插件注册了 `context_debug` 工具，支持以下子命令：
-
-### `pool_size` — 共享池大小
+插件注册了 `context_debug` 工具：
 
 ```json
-{ "command": "pool_size" }
-// → { "local": 42, "openviking": 0 }
+{ "command": "stats" }              // 全局或按 Agent 的统计
+{ "command": "pool_size" }          // 共享池条目数
+{ "command": "recent_logs" }        // 最近操作日志
+{ "command": "evaluate" }           // 完整效果评估报告
+{ "command": "compare" }            // Token 对比数据
+{ "command": "config" }             // 当前配置
 ```
 
-### `recent_logs` — 最近操作日志
+### CLI 命令行
 
-```json
-{ "command": "recent_logs", "limit": 10, "agentId": "waicode" }
+```bash
+npx tsx src/cli.ts evaluate
+npx tsx src/cli.ts stats
+npx tsx src/cli.ts pool-size
 ```
-
-### `stats` — 统计数据
-
-```json
-{ "command": "stats" }
-{ "command": "stats", "agentId": "waicode" }
-```
-
-### `config` — 当前配置
-
-```json
-{ "command": "config" }
-```
-
-### `compare` — Token 对比
-
-```json
-{ "command": "compare", "limit": 5 }
-```
-
-### `evaluate` — 效果评估报告
-
-```json
-{ "command": "evaluate" }
-```
-
-详细报告格式见[效果评估](#效果评估)。
 
 ---
 
 ## 效果评估
 
-使用 `evaluate` 命令生成完整的效果报告：
+### 快速检查
 
-```
-📊 共享上下文效果报告
-─────────────────────
-
-池子健康度:
-  总条目: 42 | 有效条目(>50tok): 38 (90.5%)
-  平均条目大小: 120 tok
-  信噪比评分: 90.5% (建议 >70%)
-
-使用情况:
-  assemble 总次数: 156
-  命中次数: 132 (84.6%)
-  空命中: 24 (15.4%)
-
-Token 经济性:
-  共享上下文总注入 Token: 15,840
-  占总预算比例: 2.54% (配置上限 30%)
-
-跨 Agent 流向:
-  waicode → main: 45 条被使用
-  wairesearch → waicode: 23 条被使用
-  main → wairesearch: 12 条被使用
+```bash
+cat ~/.openclaw/shared-context/stats.json | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+total = d['assembleHits'] + d['assembleMisses']
+hits = d['assembleHits']
+print(f'命中率: {hits}/{total} = {hits/total*100:.1f}%' if total else '无数据')
+print(f'注入 Token: {d[\"totalSharedTokensInjected\"]}')
+print(f'占预算比: {d[\"totalSharedTokensInjected\"]/d[\"totalBudgetUsed\"]*100:.2f}%' if d['totalBudgetUsed'] else 'N/A')
+print(f'每次命中: {d[\"totalSharedTokensInjected\"]/hits:.0f} tokens' if hits else 'N/A')
+print(f'活跃 Agent: {len(d[\"agents\"])}')
+print(f'共享池: {sum(p[\"count\"] for p in d[\"poolByAgent\"].values())} 条')
+print(f'跨 Agent 流向: {sum(len(t) for t in d[\"crossAgentFlow\"].values())} 条')
+"
 ```
 
 ### 指标说明
 
-| 指标 | 说明 |
-|------|------|
-| **总条目** | 共享池中的所有条目数 |
-| **有效条目** | Token > 50 的条目，过滤掉残留短条目 |
-| **信噪比** | 有效条目占比，建议 >70% |
-| **命中率** | assemble 时成功注入共享上下文的比例 |
-| **Token 经济性** | 共享上下文实际消耗 vs 总预算 |
-| **跨 Agent 流向** | 哪些 Agent 的上下文被哪些 Agent 使用 |
+| 指标 | 说明 | 目标 |
+|------|------|------|
+| **命中率** | assemble 时成功注入共享上下文的比例 | >30% |
+| **占预算比** | 共享 Token 占总预算的百分比 | <5% |
+| **每次命中** | 每次成功注入的平均 Token 数 | <2,000 |
+| **跨 Agent 流向** | Agent→Agent 知识传递路径数 | 持续增长 |
+
+### 对比模式日志
+
+当 `compareMode: true` 时，每次 assemble 记录对比数据：
+
+```json
+{
+  "tokensWithShared": 995,
+  "tokensWithoutShared": 253,
+  "tokenDifference": 742,
+  "percentageIncrease": "293.3"
+}
+```
+
+> 293% 的上下文增长 = 一个新 Agent 瞬间获得了其他 Agent 积累的知识。
+
+完整评估方案：[docs/evaluation-plan.md](./docs/evaluation-plan.md)
 
 ---
 
-## CLI 命令行工具
+## 风险与应对
 
-插件自带 CLI，可直接在终端使用调试工具：
+| 风险 | 严重程度 | 应对措施 |
+|------|---------|---------|
+| **隐私泄露** | 🔴 高 | 入池前过滤敏感内容；使用 Agent 级 source 配置 |
+| **错误传播** | 🔴 高 | Agent A 的错误信息可能通过共享池传播给所有 Agent |
+| **噪声注入** | 🟡 中 | 入池过滤 + 未来语义搜索（OpenViking）可大幅改善 |
+| **上下文混淆** | 🟡 中 | 共享内容用 `=== Shared Context ===` 明确标记 |
+| **存储膨胀** | 🟢 低 | `maxContextEntries` 上限 + afterTurn/compact 清理 |
+| **延迟** | 🟢 低 | 当前 <1ms（本地文件 I/O） |
 
-```bash
-# 用 tsx 直接运行
-npx tsx src/cli.ts <命令>
+---
 
-# 或全局安装
-npm link
-context-shared-claw <命令>
-```
+## 路线图
 
-### 命令列表
-
-```bash
-context-shared-claw evaluate              # 效果评估报告
-context-shared-claw stats                 # 统计数据
-context-shared-claw stats --agent waicode # 指定 Agent 的统计
-context-shared-claw pool-size             # 共享池大小
-context-shared-claw recent-logs           # 最近操作日志
-context-shared-claw recent-logs --limit 5 # 最近 5 条日志
-context-shared-claw config                # 当前配置
-```
-
-### 环境变量
-
-| 变量 | 说明 |
-|------|------|
-| `CONTEXT_SHARED_CONFIG` | 自定义配置文件路径（覆盖自动检测） |
-
-配置自动检测顺序：OpenClaw 插件目录 → shared-context 目录 → OpenClaw 主配置。
+| 阶段 | 状态 | 说明 |
+|------|------|------|
+| Local source | ✅ 完成 | 文件共享池，时间排序检索 |
+| 包装模式 | ✅ 完成 | 非共享 Agent 零影响 |
+| 评估框架 | ✅ 完成 | 统计、对比模式、评估报告 |
+| OpenViking 集成 | 🔜 下一步 | 语义向量搜索 + 分布式存储 + 多机共享 |
+| 隐私过滤 | 📋 计划 | 自动检测和脱敏敏感内容 |
+| 语义去重 | 📋 计划 | 向量去重替代 bigram 相似度 |
 
 ---
 
 ## 测试
 
-测试使用 Node.js 内置 `node:test` 和 `node:assert` 模块，通过 tsx 运行：
-
 ```bash
-# 安装开发依赖
 npm install -D tsx
-
-# 运行所有测试
 npx tsx --test tests/*.test.ts
 ```
-
-### 测试套件
 
 | 文件 | 测试数 | 覆盖内容 |
 |------|:-----:|---------|
 | `ingest-filter.test.ts` | 7 | 短内容、空内容、正常消息、心跳、Announce、工具截断、去重 |
-| `write-isolation.test.ts` | 4 | Agent 目录隔离、跨 Agent 读取、自身排除、快速写入 |
+| `write-isolation.test.ts` | 4 | 目录隔离、跨 Agent 读取、自身排除、快速写入 |
 | `elastic-budget.test.ts` | 3 | 正常预算、预算紧张、预算耗尽 |
 | `atomic-write.test.ts` | 2 | 文件可解析、无 .tmp 残留 |
 | `evaluate.test.ts` | 2 | 报告格式、空池默认值 |

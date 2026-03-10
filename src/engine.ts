@@ -295,8 +295,17 @@ export class SharedContextEngine {
     const localSource = this.sources.get("local") as LocalSource;
 
     for (const msg of newMessages) {
+      const role = (msg as any).role || "unknown";
       const content = extractText(msg.content);
       if (!content || content.length < 50) continue;
+
+      // 过滤系统消息和内部提示 / Filter system messages and internal prompts
+      if (role === "system") continue;
+      if (content.includes("Execute your Session Startup sequence")) continue;
+      if (content.includes("[Internal task completion event]")) continue;
+
+      // 只共享 assistant 和有意义的 user 消息 / Only share assistant and meaningful user messages
+      if (role !== "assistant" && role !== "user") continue;
 
       // 去重 / Dedup
       if (localSource) {

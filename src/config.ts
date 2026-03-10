@@ -100,12 +100,24 @@ export function getAgentConfig(
 /**
  * 从 sessionId 提取 agentId
  * Extract agentId from sessionId
+ *
+ * 支持的格式 / Supported formats:
+ *   "session:agent:<agentId>:..."  → agentId
+ *   "agent:<agentId>:..."          → agentId
+ *   "<agentId>"                    → agentId (直接使用)
  */
 export function extractAgentId(sessionId: string): string {
-  // 格式: "agent:<agentId>:..." 或直接是 agentId
   const parts = sessionId.split(":");
+
+  // 格式: "session:agent:<agentId>:..."
+  if (parts[0] === "session" && parts[1] === "agent" && parts.length >= 3) {
+    return parts[2];
+  }
+
+  // 格式: "agent:<agentId>:..."
   if (parts[0] === "agent" && parts.length >= 2) {
     return parts[1];
   }
+
   return sessionId;
 }

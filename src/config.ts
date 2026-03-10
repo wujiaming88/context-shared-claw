@@ -85,16 +85,31 @@ export function resolveConfig(raw: Record<string, unknown> = {}): PluginConfig {
 }
 
 /**
- * 获取指定 Agent 的配置（未配置则返回 undefined）
- * Get config for a specific agent, undefined if not configured
+ * 获取指定 Agent 的配置
+ * Get config for a specific agent
+ *
+ * 匹配顺序 / Match order:
+ *   1. 精确匹配 agentId（如 "main"）
+ *   2. 通配符 "*"（匹配所有未精确配置的 Agent）
+ *   3. 未找到返回 undefined
  */
 export function getAgentConfig(
   config: PluginConfig,
   sessionId: string
 ): AgentConfig | undefined {
-  // sessionId 格式通常是 "agent:<agentId>:..." / sessionId format is typically "agent:<agentId>:..."
   const agentId = extractAgentId(sessionId);
-  return config.agents[agentId];
+
+  // 1. 精确匹配 / Exact match
+  if (config.agents[agentId]) {
+    return config.agents[agentId];
+  }
+
+  // 2. 通配符匹配 / Wildcard match
+  if (config.agents["*"]) {
+    return config.agents["*"];
+  }
+
+  return undefined;
 }
 
 /**

@@ -84,17 +84,15 @@ shared-context/entries/
 
 ## Installation
 
-Place the plugin directory under OpenClaw's plugins path:
+Place the plugin in OpenClaw's extensions directory:
 
 ```bash
-# Clone the repo
+# Option A: Clone directly into extensions
+cd ~/.openclaw/extensions
 git clone https://github.com/wujiaming88/context-shared-claw.git
 
-# Move to OpenClaw plugins directory
-mv context-shared-claw ~/.openclaw/plugins/context-shared-claw
-
-# Or use a symlink
-ln -s /path/to/context-shared-claw ~/.openclaw/plugins/context-shared-claw
+# Option B: Symlink from your project
+ln -s /path/to/context-shared-claw ~/.openclaw/extensions/context-shared-claw
 ```
 
 OpenClaw uses jiti for JIT TypeScript compilation — no build step needed.
@@ -103,42 +101,53 @@ OpenClaw uses jiti for JIT TypeScript compilation — no build step needed.
 
 ## Configuration
 
-Add plugin configuration to your OpenClaw config:
+Add plugin configuration to your OpenClaw config file (`~/.openclaw/openclaw.json`):
 
 ```json
 {
   "plugins": {
-    "context-shared-claw": {
-      "agents": {
-        "main": {
-          "shared": true,
-          "sources": ["local"],
-          "writeTo": "local"
-        },
-        "waicode": {
-          "shared": true,
-          "sources": ["local"]
-        },
-        "wairesearch": {
-          "shared": true,
-          "sources": ["local", "openviking"]
+    "entries": {
+      "context-shared-claw": {
+        "enabled": true,
+        "config": {
+          "agents": {
+            "main": {
+              "shared": true,
+              "sources": ["local"],
+              "writeTo": "local"
+            },
+            "waicode": {
+              "shared": true,
+              "sources": ["local"]
+            },
+            "wairesearch": {
+              "shared": true,
+              "sources": ["local", "openviking"]
+            }
+          },
+          "localDir": "~/.openclaw/shared-context",
+          "openviking": {
+            "host": "http://localhost:1933",
+            "apiKey": "your-api-key",
+            "timeout": 5000
+          },
+          "compareMode": false,
+          "debugLevel": "basic",
+          "maxContextEntries": 100,
+          "defaultTokenBudget": 4000,
+          "sharedBudgetRatio": 0.3,
+          "announceProtectTTL": 86400000
         }
-      },
-      "localDir": "~/.openclaw/shared-context",
-      "openviking": {
-        "host": "http://localhost:1933",
-        "apiKey": "your-api-key",
-        "timeout": 5000
-      },
-      "compareMode": false,
-      "debugLevel": "basic",
-      "maxContextEntries": 100,
-      "defaultTokenBudget": 4000,
-      "sharedBudgetRatio": 0.3,
-      "announceProtectTTL": 86400000
+      }
+    },
+    "slots": {
+      "contextEngine": "context-shared-claw"
     }
   }
 }
+```
+
+> **Note**: Plugin config goes under `plugins.entries.<id>.config`, not directly under `plugins`. The `plugins.slots.contextEngine` tells OpenClaw to use this plugin as the active Context Engine, replacing the default `legacy` engine.
 ```
 
 ### Configuration Fields

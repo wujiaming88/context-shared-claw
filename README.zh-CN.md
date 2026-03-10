@@ -83,17 +83,15 @@ shared-context/entries/
 
 ## 安装
 
-将插件目录放到 OpenClaw 的 plugins 目录下：
+将插件放到 OpenClaw 的扩展目录下：
 
 ```bash
-# 克隆仓库
+# 方式 A：直接 clone 到扩展目录
+cd ~/.openclaw/extensions
 git clone https://github.com/wujiaming88/context-shared-claw.git
 
-# 移动到 OpenClaw plugins 目录
-mv context-shared-claw ~/.openclaw/plugins/context-shared-claw
-
-# 或者使用符号链接
-ln -s /path/to/context-shared-claw ~/.openclaw/plugins/context-shared-claw
+# 方式 B：符号链接
+ln -s /path/to/context-shared-claw ~/.openclaw/extensions/context-shared-claw
 ```
 
 OpenClaw 使用 jiti 即时编译 TypeScript，无需构建步骤。
@@ -102,42 +100,53 @@ OpenClaw 使用 jiti 即时编译 TypeScript，无需构建步骤。
 
 ## 配置
 
-在 OpenClaw 配置文件中添加插件配置：
+在 OpenClaw 配置文件（`~/.openclaw/openclaw.json`）中添加插件配置：
 
 ```json
 {
   "plugins": {
-    "context-shared-claw": {
-      "agents": {
-        "main": {
-          "shared": true,
-          "sources": ["local"],
-          "writeTo": "local"
-        },
-        "waicode": {
-          "shared": true,
-          "sources": ["local"]
-        },
-        "wairesearch": {
-          "shared": true,
-          "sources": ["local", "openviking"]
+    "entries": {
+      "context-shared-claw": {
+        "enabled": true,
+        "config": {
+          "agents": {
+            "main": {
+              "shared": true,
+              "sources": ["local"],
+              "writeTo": "local"
+            },
+            "waicode": {
+              "shared": true,
+              "sources": ["local"]
+            },
+            "wairesearch": {
+              "shared": true,
+              "sources": ["local", "openviking"]
+            }
+          },
+          "localDir": "~/.openclaw/shared-context",
+          "openviking": {
+            "host": "http://localhost:1933",
+            "apiKey": "your-api-key",
+            "timeout": 5000
+          },
+          "compareMode": false,
+          "debugLevel": "basic",
+          "maxContextEntries": 100,
+          "defaultTokenBudget": 4000,
+          "sharedBudgetRatio": 0.3,
+          "announceProtectTTL": 86400000
         }
-      },
-      "localDir": "~/.openclaw/shared-context",
-      "openviking": {
-        "host": "http://localhost:1933",
-        "apiKey": "your-api-key",
-        "timeout": 5000
-      },
-      "compareMode": false,
-      "debugLevel": "basic",
-      "maxContextEntries": 100,
-      "defaultTokenBudget": 4000,
-      "sharedBudgetRatio": 0.3,
-      "announceProtectTTL": 86400000
+      }
+    },
+    "slots": {
+      "contextEngine": "context-shared-claw"
     }
   }
 }
+```
+
+> **注意**：插件配置放在 `plugins.entries.<id>.config` 下，不是直接放在 `plugins` 下。`plugins.slots.contextEngine` 告诉 OpenClaw 使用此插件作为上下文引擎，替换默认的 `legacy` 引擎。
 ```
 
 ### 配置字段说明

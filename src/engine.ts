@@ -25,6 +25,26 @@ import { generateCompare } from "./debug/compare.js";
 import type { SharedSource } from "./sources/local.js";
 
 /**
+ * 从 AgentMessage.content 提取纯文本
+ * Extract plain text from AgentMessage.content (handles string, array, and other types)
+ */
+function extractText(content: unknown): string {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part: any) => {
+        if (typeof part === "string") return part;
+        if (part?.type === "text" && typeof part.text === "string") return part.text;
+        return "";
+      })
+      .filter(Boolean)
+      .join(" ");
+  }
+  return String(content);
+}
+
+/**
  * SharedContextEngine — 包装模式共享上下文引擎
  * Wrapper-pattern shared context engine
  *
@@ -146,7 +166,7 @@ export class SharedContextEngine {
     // 以下是共享逻辑 / Below is shared-only logic
     if (params.isHeartbeat) return passthrough;
 
-    const content = params.message.content || "";
+    const content = extractText(params.message.content);
     if (!content.trim()) return passthrough;
 
     // Announce 检测
@@ -292,7 +312,7 @@ export class SharedContextEngine {
     // Legacy behavior: pass-through (return original messages as-is)
     // Runtime handles sanitize/validate/limit pipeline
     const estimatedTokens = params.messages.reduce(
-      (sum, m) => sum + estimateTokens(m.content || ""), 0
+      (sum, m) => sum + estimateTokens(m.content), 0
     );
     const legacyResult = {
       messages: params.messages,
@@ -324,7 +344,7 @@ export class SharedContextEngine {
 
     // 检索共享上下文 / Retrieve shared context
     const recentMessages = params.messages.slice(-5);
-    const query = recentMessages.map((m) => m.content || "").filter(Boolean).join(" ");
+    const query = recentMessages.map((m) => extractText(m.content)).filter(Boolean).join(" ");
 
     const allEntries: ContextEntry[] = [];
     for (const sourceName of agentCfg.sources) {

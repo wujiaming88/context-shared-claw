@@ -12,16 +12,41 @@ const CJK_REGEX = /[\u4e00-\u9fff\u3400-\u4dbf\u{20000}-\u{2a6df}\u{2a700}-\u{2b
 /**
  * 估算文本的 token 数量
  * Estimate token count for a text string
+ *
+ * 兼容 AgentMessage.content 的多种格式：
+ * - string: 直接估算
+ * - array: 提取所有 text 部分拼接后估算（多模态消息）
+ * - other: 转为字符串后估算
  */
-export function estimateTokens(text: string): number {
+export function estimateTokens(text: unknown): number {
+  // 处理非字符串 content（如 AgentMessage 的多模态内容数组）
+  // Handle non-string content (e.g. multimodal content arrays in AgentMessage)
   if (!text) return 0;
 
+  let str: string;
+  if (typeof text === "string") {
+    str = text;
+  } else if (Array.isArray(text)) {
+    // 多模态内容：提取所有 text 部分 / Multimodal: extract all text parts
+    str = text
+      .map((part: any) => {
+        if (typeof part === "string") return part;
+        if (part?.type === "text" && typeof part.text === "string") return part.text;
+        return "";
+      })
+      .join(" ");
+  } else {
+    str = String(text);
+  }
+
+  if (!str) return 0;
+
   // 计算 CJK 字符数 / Count CJK characters
-  const cjkMatches = text.match(CJK_REGEX);
+  const cjkMatches = str.match(CJK_REGEX);
   const cjkCount = cjkMatches ? cjkMatches.length : 0;
 
   // 非 CJK 字符数 / Non-CJK character count
-  const nonCjkLength = text.length - cjkCount;
+  const nonCjkLength = str.length - cjkCount;
 
   // CJK: ~2 chars/token, 非 CJK: ~4 chars/token
   const cjkTokens = Math.ceil(cjkCount / 2);

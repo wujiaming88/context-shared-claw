@@ -29,6 +29,10 @@ export interface PluginConfig {
   debugLevel: "off" | "basic" | "verbose";
   maxContextEntries: number;
   defaultTokenBudget: number;
+  /** 共享上下文占总预算的最大比例 (0-1) / Max ratio of budget for shared context */
+  sharedBudgetRatio: number;
+  /** Announce 条目保护 TTL（毫秒）/ TTL for protected announce entries (ms) */
+  announceProtectTTL: number;
 }
 
 /** 共享上下文条目 / Shared context entry */
@@ -75,6 +79,8 @@ export function resolveConfig(raw: Record<string, unknown> = {}): PluginConfig {
     debugLevel: (raw.debugLevel as PluginConfig["debugLevel"]) || "basic",
     maxContextEntries: (raw.maxContextEntries as number) ?? 100,
     defaultTokenBudget: (raw.defaultTokenBudget as number) ?? 4000,
+    sharedBudgetRatio: Math.min(1, Math.max(0, (raw.sharedBudgetRatio as number) ?? 0.3)),
+    announceProtectTTL: (raw.announceProtectTTL as number) ?? 24 * 60 * 60 * 1000, // 默认 24h
   };
 }
 

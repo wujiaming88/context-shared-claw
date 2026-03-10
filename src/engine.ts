@@ -88,6 +88,13 @@ export class SharedContextEngine {
   /**
    * ingest — 消息摄入
    * Ingest a message into the shared context pool
+   *
+   * 平衡策略：Announce 消息不写入共享池（避免重复注入和无限累积），
+   * 只有普通对话消息才进入共享池供其他 Agent 检索。
+   *
+   * Balanced strategy: Announce messages are NOT written to the shared pool
+   * (prevents duplication and unbounded accumulation). Only regular conversation
+   * messages enter the shared pool for cross-agent retrieval.
    */
   async ingest(params: {
     sessionId: string;
@@ -108,16 +115,39 @@ export class SharedContextEngine {
     const content = params.message.content || "";
     if (!content.trim()) return {};
 
-    const tokens = estimateTokens(content);
-    const startTime = Date.now();
-
-    // 检测是否为 Announce 消息 / Detect announce messages
+    // 检测 Announce 消息：不写入共享池
+    // Detect Announce messages: do NOT write to shared pool
+    // 原因：Announce 已存在于 Runtime 消息流中，写入共享池会导致：
+    //   1. 重复注入（其他 Agent 的 assemble 会再次拉到）
+    //   2. 无限累积（受保护条目越来越多）
+    //   3. compact 无法释放空间
+    // Reason: Announce already exists in Runtime message stream. Writing to pool causes:
+    //   1. Duplicate injection (other agents' assemble would pull it again)
+    //   2. Unbounded accumulation (protected entries grow forever)
+    //   3. compact cannot free enough space
     const msg = params.message as any;
     const isAnnounce =
       msg.type === "agent_internal_event" ||
       msg.metadata?.eventType === "task_completion" ||
       msg.metadata?.source === "subagent" ||
       (typeof content === "string" && content.includes("[Internal task completion event]"));
+
+    if (isAnnounce) {
+      this.logger.log({
+        timestamp: new Date().toISOString(),
+        agentId,
+        sessionId: params.sessionId,
+        operation: "ingest_skip_announce",
+        details: {
+          reason: "Announce messages are managed by Runtime, not shared pool",
+          contentPreview: content.slice(0, 100),
+        },
+      });
+      return {};
+    }
+
+    const tokens = estimateTokens(content);
+    const startTime = Date.now();
 
     // 创建上下文条目 / Create context entry
     const entry: ContextEntry = {
@@ -128,7 +158,7 @@ export class SharedContextEngine {
       role: params.message.role,
       timestamp: Date.now(),
       tokens,
-      tags: isAnnounce ? ["task_completion", "announce", "protected"] : [],
+      tags: [],
       source: "local",
     };
 
@@ -211,15 +241,12 @@ export class SharedContextEngine {
       },
     });
 
-    // 清理过期条目（保护 Announce 消息）/ Cleanup expired entries (protect Announce)
+    // 清理过期条目 / Cleanup expired entries
+    // Announce 消息不在共享池中，无需特殊保护
+    // Announce messages are not in the shared pool, no special protection needed
     const localSource = this.sources.get("local") as LocalSource;
     if (localSource) {
-      await localSource.cleanup(this.config.maxContextEntries, {
-        protectFilter: (entry: ContextEntry) =>
-          entry.tags?.includes("task_completion") ||
-          entry.tags?.includes("announce") ||
-          false,
-      });
+      await localSource.cleanup(this.config.maxContextEntries);
     }
   }
 
@@ -227,8 +254,15 @@ export class SharedContextEngine {
    * assemble — 上下文组装
    * Assemble shared context into the message stream
    *
-   * 这是核心方法：从共享池中检索相关上下文，注入到消息流
-   * Core method: retrieve relevant shared context and inject into message stream
+   * 平衡策略：弹性预算分配
+   * - 共享上下文预算 = min(budget × sharedBudgetRatio, budget - 已用消息 Token)
+   * - Announce 消息由 Runtime 管理，不在此处处理
+   * - 当消息流较短时，共享上下文可多占；消息流满时，共享自动让步
+   *
+   * Balanced strategy: Elastic budget allocation
+   * - Shared budget = min(budget × sharedBudgetRatio, budget - existing message tokens)
+   * - Announce messages are managed by Runtime, not handled here
+   * - When message stream is short, shared context gets more; when full, it yields
    */
   async assemble(params: {
     sessionId: string;
@@ -251,21 +285,36 @@ export class SharedContextEngine {
     const startTime = Date.now();
     const budget = params.tokenBudget || this.config.defaultTokenBudget;
 
-    // 保护 Announce 消息：识别 AgentInternalEvent（子代理完成通知）
-    // Protect Announce messages: identify AgentInternalEvent (subagent completion)
-    // 这些消息必须始终包含在组装结果中，不能被共享上下文挤掉
-    const announceMessages = params.messages.filter(
-      (m: any) => m.type === "agent_internal_event" ||
-        m.metadata?.eventType === "task_completion" ||
-        m.metadata?.source === "subagent" ||
-        (m.role === "user" && typeof m.content === "string" &&
-          m.content.includes("[Internal task completion event]"))
+    // 弹性预算计算 / Elastic budget calculation
+    // 1. 计算现有消息流已占用的 Token
+    const existingTokens = params.messages.reduce(
+      (sum, m) => sum + estimateTokens(m.content || ""), 0
     );
 
-    // 预留 Announce 消息的 token 预算 / Reserve token budget for announce messages
-    const announceTokens = announceMessages.reduce(
-      (sum: number, m: any) => sum + estimateTokens(m.content || ""), 0
-    );
+    // 2. 计算共享上下文可用预算（取配置比例和剩余空间的较小值）
+    //    确保共享上下文不会导致总体超出预算
+    const ratioBasedBudget = Math.floor(budget * this.config.sharedBudgetRatio);
+    const remainingBudget = Math.floor((budget - existingTokens) * 0.8); // 留 20% 安全余量
+    const sharedBudget = Math.max(0, Math.min(ratioBasedBudget, remainingBudget));
+
+    // 预算为 0 时跳过共享上下文 / Skip shared context when budget is 0
+    if (sharedBudget === 0) {
+      this.logger.log({
+        timestamp: new Date().toISOString(),
+        agentId,
+        sessionId: params.sessionId,
+        operation: "assemble_skip",
+        details: {
+          reason: "No budget for shared context",
+          budget,
+          existingTokens,
+          ratioBasedBudget,
+          remainingBudget,
+        },
+      });
+      this.stats.recordAssemble(agentId, 0, false);
+      return {};
+    }
 
     // 从最后几条消息提取查询关键词 / Extract query from recent messages
     const recentMessages = params.messages.slice(-5);
@@ -284,10 +333,7 @@ export class SharedContextEngine {
       }
     }
 
-    // 按相关性和时间排序，截断到 token 预算 / Sort and truncate to budget
-    // 预留 50% 预算给共享上下文，扣除 Announce 消息占用
-    // Reserve 50% budget for shared context, minus announce token reservation
-    const sharedBudget = Math.floor((budget - announceTokens) * 0.5);
+    // 按相关性和时间排序，截断到弹性预算 / Sort and truncate to elastic budget
     let usedTokens = 0;
     const selectedEntries: ContextEntry[] = [];
 
@@ -342,6 +388,9 @@ export class SharedContextEngine {
       details: {
         budget,
         sharedBudget,
+        existingTokens,
+        ratioBasedBudget,
+        remainingBudget,
         totalCandidates: allEntries.length,
         sources: agentCfg.sources,
       },
@@ -357,8 +406,13 @@ export class SharedContextEngine {
    * compact — 上下文压缩
    * Compact shared context to save tokens
    *
-   * 注意：task_completion 类型的消息（Announce 结果）不可被压缩
-   * Note: task_completion messages (Announce results) are never compacted
+   * 平衡策略：所有条目都可被清理，无永久保护。
+   * Announce 消息不在共享池中，所以 compact 只处理普通条目，
+   * 不存在"保护导致无法释放空间"的风险。
+   *
+   * Balanced strategy: All entries are cleanable, no permanent protection.
+   * Announce messages are not in the shared pool, so compact only handles
+   * regular entries — no risk of "protection preventing space reclamation".
    */
   async compact(params: {
     sessionId: string;
@@ -388,15 +442,15 @@ export class SharedContextEngine {
     const preCount = await localSource.count();
     const preTokens = params.currentTokenCount || 0;
 
-    // 清理过期条目，但保护 Announce/task_completion 条目
-    // Cleanup old entries, but protect Announce/task_completion entries
-    const removed = await localSource.cleanup(this.config.maxContextEntries, {
-      protectFilter: (entry: ContextEntry) =>
-        entry.tags?.includes("task_completion") ||
-        entry.tags?.includes("announce") ||
-        entry.content?.includes("[Internal task completion event]") ||
-        false,
-    });
+    // force 模式：更激进的清理（保留更少条目）
+    // Force mode: more aggressive cleanup (keep fewer entries)
+    const targetEntries = params.force
+      ? Math.floor(this.config.maxContextEntries * 0.5) // force: 保留一半
+      : this.config.maxContextEntries;
+
+    // 所有条目均可清理，无永久保护
+    // All entries are cleanable, no permanent protection
+    const removed = await localSource.cleanup(targetEntries);
 
     const postCount = await localSource.count();
     const estimatedRemovedTokens = removed * 50; // 估算每条约50 token
@@ -505,6 +559,8 @@ export class SharedContextEngine {
       debugLevel: this.config.debugLevel,
       maxContextEntries: this.config.maxContextEntries,
       defaultTokenBudget: this.config.defaultTokenBudget,
+      sharedBudgetRatio: this.config.sharedBudgetRatio,
+      announceProtectTTL: this.config.announceProtectTTL,
     };
   }
 }

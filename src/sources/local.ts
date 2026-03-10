@@ -138,32 +138,40 @@ export class LocalSource implements SharedSource {
     this._loadIndex();
     if (this.entries.length <= maxEntries) return 0;
 
-    // 分离受保护条目（Announce/task_completion）和普通条目
-    // Separate protected entries (Announce/task_completion) from regular ones
+    // 如果有保护过滤器，分离受保护条目
+    // If protectFilter provided, separate protected entries
     const protectFn = options?.protectFilter;
-    const protectedEntries: ContextEntry[] = [];
-    const regularEntries: ContextEntry[] = [];
 
-    for (const entry of this.entries) {
-      if (protectFn && protectFn(entry)) {
-        protectedEntries.push(entry);
-      } else {
-        regularEntries.push(entry);
+    if (protectFn) {
+      const protectedEntries: ContextEntry[] = [];
+      const regularEntries: ContextEntry[] = [];
+      for (const entry of this.entries) {
+        if (protectFn(entry)) {
+          protectedEntries.push(entry);
+        } else {
+          regularEntries.push(entry);
+        }
       }
+      const regularBudget = Math.max(0, maxEntries - protectedEntries.length);
+      regularEntries.sort((a, b) => b.timestamp - a.timestamp);
+      const removed = regularEntries.splice(regularBudget);
+      this.entries = [...protectedEntries, ...regularEntries];
+      this._saveIndex();
+      this._cleanupFiles(removed);
+      return removed.length;
     }
 
-    // 只从普通条目中清理，受保护条目始终保留
-    // Only cleanup from regular entries, protected ones are always kept
-    const regularBudget = Math.max(0, maxEntries - protectedEntries.length);
-    regularEntries.sort((a, b) => b.timestamp - a.timestamp);
-    const removed = regularEntries.splice(regularBudget);
-
-    // 重建索引 / Rebuild index
-    this.entries = [...protectedEntries, ...regularEntries];
+    // 默认：按时间排序，保留最新的 / Default: sort by time, keep newest
+    this.entries.sort((a, b) => b.timestamp - a.timestamp);
+    const removed = this.entries.splice(maxEntries);
     this._saveIndex();
+    this._cleanupFiles(removed);
+    return removed.length;
+  }
 
-    // 清理单独文件 / Cleanup individual files
-    for (const entry of removed) {
+  /** 清理单独文件 / Cleanup individual files */
+  private _cleanupFiles(entries: ContextEntry[]): void {
+    for (const entry of entries) {
       try {
         fs.unlinkSync(
           path.join(this.baseDir, entry.agentId, `${entry.id}.json`)
@@ -172,7 +180,5 @@ export class LocalSource implements SharedSource {
         // 忽略 / Ignore
       }
     }
-
-    return removed.length;
   }
 }

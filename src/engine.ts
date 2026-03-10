@@ -131,6 +131,10 @@ export class SharedContextEngine {
     message: { role: string; content?: string };
     isHeartbeat?: boolean;
   }) {
+    // 诊断日志：确认 Runtime 是否调用了 ingest / Diagnostic: confirm runtime calls ingest
+    this.apiLogger?.info?.(`[context-shared-claw] ingest called | sessionId=${params.sessionId} | role=${params.message?.role} | contentType=${typeof params.message?.content} | contentLen=${String(params.message?.content || '').length}`);
+
+    try {
     const { shared, agentId, agentCfg } = this._isShared(params.sessionId);
 
     // Legacy behavior: no-op (Runtime handles message persistence)
@@ -240,10 +244,11 @@ export class SharedContextEngine {
     }
 
     return passthrough;
+    } catch (err: any) {
+      this.apiLogger?.error?.(`[context-shared-claw] ingest ERROR: ${err?.message || err}`);
+      return { ingested: false };
+    }
   }
-
-  /**
-   * afterTurn — 轮次结束
    * 始终委托 legacy + 共享 Agent 清理共享池
    */
   async afterTurn(params: {
@@ -280,6 +285,10 @@ export class SharedContextEngine {
     messages: Array<{ role: string; content?: string }>;
     tokenBudget?: number;
   }) {
+    // 诊断日志 / Diagnostic
+    this.apiLogger?.info?.(`[context-shared-claw] assemble called | sessionId=${params.sessionId} | msgCount=${params.messages?.length} | budget=${params.tokenBudget}`);
+
+    try {
     // Legacy behavior: pass-through (return original messages as-is)
     // Runtime handles sanitize/validate/limit pipeline
     const estimatedTokens = params.messages.reduce(
@@ -420,6 +429,10 @@ export class SharedContextEngine {
     }
 
     return legacyResult;
+    } catch (err: any) {
+      this.apiLogger?.error?.(`[context-shared-claw] assemble ERROR: ${err?.message || err}`);
+      return { messages: params.messages, estimatedTokens: 0 };
+    }
   }
 
   /**
